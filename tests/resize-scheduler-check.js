@@ -119,5 +119,12 @@ check('duplicates do not postpone settling; empty and disposed viewports schedul
   f.scheduler.dispose(); f.advance(1000); f.scheduler.update(size(202));
   assert(f.starts.length === count && f.tasks.size === 0, 'Disposed scheduler started work');
 });
+check('navigation revisions invalidate same-size frames; held fingers do not settle', () => {
+  const f=fixture();initial(f);f.scheduler.hold(true);
+  f.scheduler.update({...size(100),view:{revision:1}});f.advance(1000);
+  assert(f.starts.length===1 && f.mode()==='deferred','Held gesture calculated a frame');
+  f.scheduler.update({...size(100),view:{revision:2}});f.scheduler.hold(false);f.advance(0);
+  assert(f.last().kind==='final' && f.last().size.view.revision===2,'Navigation reused the previous view');
+});
 report(`${checks} resize scheduler checks passed.`);
 var testDone = true;

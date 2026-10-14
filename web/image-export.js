@@ -40,25 +40,15 @@ export function createImageExport(root, isCurrent) {
             const file = new File([data.blob], name, {type: 'image/png'});
             const url = URL.createObjectURL(file); job.url = url;
             const image = new Image(); image.className = 'export-image'; image.alt = '';
-            // Images are natively draggable with the default "auto" state.
-            // Explicit draggable=true can select WebKit's DHTML drag path.
+            image.draggable = false;
             image.setAttribute('aria-hidden', 'true');
             Object.assign(image.style, {position: 'absolute', inset: '0', width: '100%', height: '100%', display: 'block'});
             image.src = url; await image.decode();
             if (task !== job || !isCurrent(frame)) { if (task === job) cancel(); return; }
-            // Leave native image drag data and contextmenu behavior intact.
-            // Chromium additionally understands this filename/download hint.
-            let dragging = false, removed = false;
-            const release = () => { if (removed && !dragging) URL.revokeObjectURL(url); };
-            image.addEventListener('dragstart', event => {
-              dragging = true;
-              event.dataTransfer?.setData('DownloadURL', `image/png:${name}:${url}`);
-            });
-            image.addEventListener('dragend', () => { dragging = false; release(); });
             frame.layer.append(image);
             const observer = new MutationObserver(() => {
               if (image.isConnected) return;
-              removed = true; observer.disconnect(); release();
+              observer.disconnect(); URL.revokeObjectURL(url);
             });
             observer.observe(root, {childList: true, subtree: true});
             // The decoded PNG replaces the tile surfaces without retaining a

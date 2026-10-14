@@ -7,10 +7,10 @@ export function createResizeScheduler({start, cancel, reuse, state,
   now = () => performance.now(), setTimer = setTimeout, clearTimer = clearTimeout,
   requestFrame = requestAnimationFrame, cancelFrame = cancelAnimationFrame}) {
   let latest, active, completeFrame, costPerPixel, sequence = 0;
-  let resizing = false, deferred = false, disposed = false;
+  let resizing = false, deferred = false, disposed = false, held = false;
   let settleTimer = 0, deadlineTimer = 0, frameRequest = 0, mode;
   const same = (a, b) => a && b && a.width === b.width && a.height === b.height &&
-    a.cssWidth === b.cssWidth && a.cssHeight === b.cssHeight;
+    a.cssWidth === b.cssWidth && a.cssHeight === b.cssHeight && a.view?.revision === b.view?.revision;
 
   function notify(next, reason) {
     if (mode === next) return;
@@ -65,7 +65,8 @@ export function createResizeScheduler({start, cancel, reuse, state,
     if (!active && !completeFrame && !resizing) { notify('idle', 'initial'); begin('final'); return; }
     if (!resizing) { resizing = true; deferred = false; notify('live', 'resize'); }
     if (active?.kind === 'final') stop();
-    clearTimer(settleTimer); settleTimer = setTimer(settle, RESIZE_SETTLE_MS);
+    clearTimer(settleTimer); settleTimer = held ? 0 : setTimer(settle, RESIZE_SETTLE_MS);
+    if (held) { defer('navigation'); return; }
     queueLive();
   }
   function accept(id) {
@@ -96,5 +97,11 @@ export function createResizeScheduler({start, cancel, reuse, state,
     disposed = true;
     clearTimer(settleTimer); cancelFrame(frameRequest); stop();
   }
-  return {update, accept, complete, invalidate, dispose};
+  function hold(value) {
+    if (disposed || held === value) return;
+    held = value;
+    if (held) { clearTimer(settleTimer); settleTimer = 0; resizing = true; defer('navigation'); }
+    else if (latest) { clearTimer(settleTimer); settleTimer = setTimer(settle, 0); }
+  }
+  return {update, accept, complete, invalidate, hold, dispose};
 }

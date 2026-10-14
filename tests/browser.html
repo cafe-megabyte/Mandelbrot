@@ -12,12 +12,13 @@ iframe{display:block;border:0;background:#000;width:320px;height:180px}pre{white
 <button id="run">Run pixel and resize checks</button>
 <button id="slow-test">Test adaptive presentation</button>
 <button id="adaptive-resize">Test adaptive live resize</button>
-<button id="image-export">Test full-image PNG and drag data</button>
+<button id="image-export">Test full-image PNG and context menu</button>
 <button id="offline-icons">Test offline icons and manifest</button>
 <button id="large-export">Test 4K / 8K PNG export</button>
 <button id="fullscreen-test">Arm fullscreen click check</button>
 <button id="reload">Reload app (also works with server stopped)</button>
 <button id="resize">Resize app without network</button>
+<button id="zoom-offline">Zoom app without network</button>
 <button id="update">Check for update</button>
 <button id="benchmark">Benchmark HD / 4K / 8K</button>
 <button id="core-benchmark">Benchmark scalar / SIMD core</button>
@@ -86,7 +87,9 @@ async function verify(root){
     scalarModule=await WebAssembly.compile(await response.arrayBuffer());
     scalarRelease=release;
   }
-  const e=new WebAssembly.Instance(scalarModule,{}).exports;e.configure(width,height);
+  const e=new WebAssembly.Instance(scalarModule,{}).exports,view=root._mandelbrotView;
+  if(view){assert(!view.deep,'Use the dedicated deep-zoom checks for this view');e.configure_view(width,height,view.centreReal,view.centreImag,view.mantissa*2**view.exponent,view.iterations);}
+  else e.configure(width,height);
   const surfaces=new Map();
   for(let y=0;y<height;y+=1024)for(let x=0;x<width;x+=1024){
     const canvas=document.createElement('canvas');canvas.width=Math.min(1024,width-x);canvas.height=Math.min(1024,height-y);
@@ -175,6 +178,14 @@ document.getElementById('update').onclick=async()=>{
   const registration=await frame.contentWindow.navigator.serviceWorker.getRegistration();
   await registration.update().catch(error=>log(`Update fetch: ${error.message}`));
   log('Update check requested. A complete new release activates automatically.');
+};
+document.getElementById('zoom-offline').onclick=async()=>{
+  try{const root=await ready(),rect=root.getBoundingClientRect();
+    root.dispatchEvent(new frame.contentWindow.WheelEvent('wheel',{clientX:rect.left+rect.width*0.65,
+      clientY:rect.top+rect.height*0.5,deltaY:-100,bubbles:true,cancelable:true}));
+    await delay(250);await verify();assert(Number(root.dataset.zoom)>0,'Offline zoom did not change the region');
+    log('PASS: wheel zoom and full-resolution PNG recomputation without network.');
+  }catch(error){log(`FAIL: ${error.message}`);}
 };
 document.getElementById('benchmark').onclick=async()=>{
   try{
@@ -357,7 +368,7 @@ document.getElementById('image-export').onclick=async()=>{
   try{
     await ready();await verify();
     const root=await ready(),image=await exported(root),url=image.src;
-    assert(image.draggable&&!image.hasAttribute('draggable'),'Image must keep the native auto drag state');
+    assert(!image.draggable,'Image drag must yield to viewport panning');
     const response=await fetch(url),bytes=new Uint8Array(await response.arrayBuffer());
     assert(response.headers.get('content-type')==='image/png','Image MIME type is not PNG');
     assert(bytes.slice(0,8).join(',')==='137,80,78,71,13,10,26,10','PNG signature missing');
@@ -367,15 +378,11 @@ document.getElementById('image-export').onclick=async()=>{
     assert(image.dispatchEvent(contextMenu)&&!contextMenu.defaultPrevented,'Native context menu was canceled');
     const transfer=new frame.contentWindow.DataTransfer();transfer.setData('text/uri-list',url);
     const drag=new frame.contentWindow.DragEvent('dragstart',{bubbles:true,cancelable:true,dataTransfer:transfer});
-    assert(image.dispatchEvent(drag)&&!drag.defaultPrevented,'Native image drag was canceled');
-    assert(transfer.getData('text/uri-list')===url,'Native image URL was cleared');
-    assert(transfer.getData('DownloadURL')===`image/png:mandelbrot-${image.naturalWidth}x${image.naturalHeight}.png:${url}`,'Desktop download hint is incorrect');
+    assert(!image.dispatchEvent(drag)&&drag.defaultPrevented,'Native image drag competes with pan');
     frame.style.width='701px';frame.style.height='413px';await delay(200);await verify();
-    assert((await fetch(url)).ok,'Active drag URL was revoked during resize');
-    image.dispatchEvent(new frame.contentWindow.DragEvent('dragend',{dataTransfer:transfer}));
     let released=false;try{await fetch(url);}catch{released=true;}
-    assert(released,'Retired PNG URL was not released after dragend');
-    log('PASS: full-image PNG, native context menu/drag defaults, PNG filename hint and drag URL lifetime.');
+    assert(released,'Retired PNG URL was not released');
+    log('PASS: full-image PNG, native context menu, panning instead of image drag and retired URL lifetime.');
 
     const release=root.dataset.release;
     for(const compression of ['deflate','store'])for(const w of [137,513]){

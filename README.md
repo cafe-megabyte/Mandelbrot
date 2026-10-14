@@ -7,12 +7,20 @@ work and displays the resulting RGBA pixels; it does not calculate the fractal
 or its colours.
 
 There are no visible controls, text, loading indicators or update prompts.
-The complete figure remains visible in both portrait and landscape windows.
-Reloading, resizing or moving the window to a display with a different pixel
+The initial figure fits both portrait and landscape windows. Pinch on a touch
+screen or trackpad, or use the mouse wheel, to explore it. Drag to move the
+visible region. The picture follows the gesture immediately; releasing it
+calculates the selected region again at full device resolution. There is no
+fixed magnification limit: coordinates, reference precision and the iteration
+budget grow with zoom depth, subject to available time and memory.
+Resizing or moving the window to a display with a different pixel
 density calculates the matching resolution. Live resizing automatically pauses
 when a frame exceeds its time budget; the final image always uses every pixel.
 The settled image also becomes a full-resolution PNG with the browser's native
-image context menu and drag behavior.
+image context menu. Right-click to copy or save the current region. Dragging
+inside the app moves the region. Zooming all the way out restores the initial
+figure; `R` or `Home` also resets it. Browser reload shortcuts retain their usual
+behavior.
 Click the picture to enter fullscreen; use the browser's Escape action to leave.
 
 ![Mandelbrot running in the browser](docs/preview.jpg)
@@ -122,7 +130,7 @@ The initial shell is black. It does not import the renderer or display a fractal
 until the controlling service worker has verified that **every required resource
 of one release** is present in Cache Storage. This includes both WASM variants,
 the renderer and its helper modules, rendering/PNG workers, navigation shell,
-icons, app manifest and third-party license. The engine and
+coordinate/navigation modules, the reference worker, icons, app manifest and third-party license. The engine and
 workers must then initialize successfully before rendering starts.
 
 Each build creates a fresh release ID only when inputs or validated products
@@ -151,14 +159,17 @@ Errors appear only in the developer console.
 ## Computation and performance
 
 The core uses `z = z² + c`, starting at zero, with the escape condition
-`|z|² > 4`. Coordinates are sampled at pixel centres using double precision.
-The view is centred at `(-0.75, 0)` and contains at least
+`|z|² > 4`. Coordinates are sampled at pixel centres. The initial view uses
+double precision; zoomed regions use the adaptive precision pipeline below.
+The initial view is centred at `(-0.75, 0)` and contains at least
 `[-2.25, 0.75] × [-1.25, 1.25]`. Equal complex-plane spacing on both axes keeps
 the figure undistorted; wider or taller windows extend the calculated view.
 
 Let `s = max(3 / physicalWidth, 2.5 / physicalHeight)`. The iteration budget
-starts at 512, increases by 256 for each halving of `s` below `1/512`, and is
-capped at 8192. Full HD uses 512 iterations, 4K uses 768, and 8K uses 1024.
+starts at 512 and increases by 256 for each halving of `s` below `1/512`, without
+the former 8192-iteration cap. Zoom reduces `s` further, so the budget increases
+with the selected spatial scale. Full HD uses 512 iterations, 4K uses 768, and
+8K uses 1024.
 The budget depends on spatial resolution, not processor speed or a time limit.
 Finite escape-time rendering approximates the set: a point that has not escaped
 within the budget is black, rather than a proof of mathematical membership.
@@ -189,7 +200,9 @@ cannot validate the SIMD module.
 
 One compiled WASM module is shared with up to eight workers, leaving one reported
 logical processor available to the browser where possible. Each worker owns a
-fixed WASM tile buffer and memory, independent of the full image dimensions.
+fixed WASM tile buffer. Deep zoom additionally allocates reference data and
+arithmetic scratch space according to precision and iteration count; this
+workspace grows with WebAssembly linear memory and is independent of image area.
 Recycled transferable 64 KiB buffers carry tiles of at most 256 × 64 pixels.
 One copy from WASM memory into that transfer buffer is necessary because ordinary
 WASM memory cannot itself be transferred. No SharedArrayBuffer, cross-origin
@@ -204,8 +217,8 @@ does not silently reduce resolution.
 
 `devicePixelContentBoxSize` is used when available, with rounded CSS dimensions
 times `devicePixelRatio` as the compatibility fallback. The target is one computed
-sample per device pixel reported by the browser. OS composition, display scaling
-and pinch magnification are outside the app's control. There is no supersampling,
+sample per device pixel reported by the browser. The app handles pinch gestures itself so the new region can be recalculated.
+OS composition, display scaling and browser page zoom remain browser-managed. There is no supersampling,
 symmetry copying, region filling or low-resolution preview.
 
 Live resizing has a **32 ms frame budget**. Events within one animation frame
@@ -231,7 +244,76 @@ budget is cooperative, checked before accepting or dispatching tiles and before
 revealing a frame. It limits computation and canvas updates, but cannot impose a
 hard deadline on synchronous browser allocation or OS/compositor scheduling.
 
-### Fullscreen, save, copy or drag the image
+### Interactive zoom and deep precision
+
+Touch uses Pointer Events and `touch-action: none` on the picture. Mouse wheel
+and trackpad gestures zoom about the pointer; two touches zoom about their
+midpoint and also translate the view. Safari's trackpad gesture events are
+handled separately. Dragging moves the region rather than initiating an image
+file drag. The right-click image menu remains native. A gesture suppresses its
+subsequent click so moving the image does not inadvertently enter fullscreen.
+
+A binary fixed-point centre uses JavaScript BigInt for coordinate navigation,
+with at least 160 guard bits beyond the zoom exponent. Only geometry is handled
+in JavaScript; Mandelbrot iteration and colouring remain in C/WASM. The scale is
+stored as a mantissa and a separate exponent, avoiding ordinary double's
+underflow at magnifications such as `2^1600`. Returning to the full view resets
+the centre. Resizing, rotation, fullscreen and automatic renderer updates retain
+the chosen view; a document reload starts at the initial view.
+
+During a gesture, CSS transforms the previous complete image. Computation and
+PNG preparation are deferred until pointer release, or 150 ms after the last
+wheel event. The selected point stays under the pointer or touch midpoint. Large worker
+workspaces are reclaimed when returning to a substantially smaller iteration
+budget or to the ordinary view.
+The resize scheduler includes the view revision in its frame identity: identical
+pixel dimensions cannot accidentally reuse a different region. Interrupted deep
+work is terminated and replaced, including its reference worker, so an obsolete
+long tile cannot delay the next selection. Once navigating, replacement images
+are revealed when complete. There is no low-resolution fractal preview.
+
+Pixel spacings of at least `2^-26` use the original scalar/SIMD orbit loop with
+a configurable centre and step. Smaller spacings use an adaptive deep-zoom pipeline:
+
+- A dedicated worker calculates a reference orbit in dynamically allocated
+  signed fixed-point arithmetic with 32-bit limbs. Initial precision covers twice
+  the negative pixel exponent plus 192 guard bits, including cancellation near
+  the escape circle. The worker repeats at higher precision and compares every
+  reference sample to 40 significant bits, increasing precision until stable.
+  A propagated fixed-point error bound requests more precision when needed.
+  Exactly repeated reference states reuse a cycle only when no arithmetic
+  rounding error has accumulated.
+- Between pixel exponents `-26` and `-80`, each tile builds a local reference
+  instead. A degree-eight series approximation shares its early nonlinear
+  orbit with all pixels in the tile. The polynomial tail, coefficient rounding
+  and clearance from the escape circle bound the permitted prefix. A compensated
+  double-double orbit provides a 106-bit intermediate fallback before resorting
+  to full fixed-point iteration. Both fallbacks propagate a rounding bound;
+  an uncertain fixed-point tile is retried with more bits.
+- Every image pixel follows its deviation from this reference. Complex numbers
+  use normalized double mantissas with separate binary exponents, so extremely
+  small deltas do not round to zero merely because they underflow a double.
+- Bivariate linear approximations (BLA) combine blocks of 16 iterations and
+  successively larger blocks. Validity radii include the image's parameter
+  offsets, a nonlinear remainder bound and clearance from the escape circle.
+  A skipped block must satisfy those conditions; otherwise ordinary perturbation
+  steps continue. Error bounds propagate through the calculation.
+- A pixel that remains uncertain falls back to full fixed-point iteration. Near `|z|=2`,
+  the bailout test uses a separately represented squared-magnitude margin; a
+  tiny positive margin must not be lost by rounding the magnitude to exactly 4.
+  The final smooth colour uses the same palette as the ordinary renderer.
+
+The methods follow [Claude Heiland-Allen's deep-zoom notes](https://mathr.co.uk/web/deep-zoom.html)
+and [perturbation and exponent rescaling](https://mathr.co.uk/blog/2021-05-14_deep_zoom_theory_and_practice.html).
+The implementation checks numerical stability and approximation error; it does
+not provide formal certificates of mathematical membership. All displayed
+images still use a finite iteration budget. Particularly difficult regions may
+need more iterations than the automatic budget supplies, and expensive fallback
+pixels can dominate rendering time. There is no promise of constant rendering
+time at arbitrary depth. Allocation and 32-bit WASM address-space limits remain
+real resource limits and are reported rather than silently reducing resolution.
+
+### Fullscreen, save or copy the image
 
 A primary click on the rendered picture calls the standard Fullscreen API,
 requesting hidden browser navigation UI. The stable viewport container becomes
@@ -241,15 +323,13 @@ changes settle for 150 ms, a fresh, unlimited final calculation evaluates every
 physical pixel of the new area, even if a transition frame had the same dimensions.
 Leaving fullscreen also forces a fresh final calculation through the resize
 scheduler. Escape remains the browser's normal exit action.
-Further clicks while fullscreen do not toggle it off. Right-click and native image
-drag keep their usual behavior. There are no fullscreen buttons or app messages;
+Further clicks while fullscreen do not toggle it off. Right-click retains its native image menu; dragging pans the selected region. There are no fullscreen buttons or app messages;
 browser-owned fullscreen indicators and exit instructions remain under browser
 control. Unsupported or denied requests leave the normal view usable. See
 [the API documentation](https://developer.mozilla.org/en-US/docs/Web/API/Element/requestFullscreen).
 
 Once the settled PNG is ready, the visible picture is a normal `<img>` element.
-Use the browser's **Copy Image**, **Save Image As**, or drag it to the desktop or
-a file-manager folder. These actions refer to the complete image at its physical
+Use the browser's **Copy Image** or **Save Image As** from the right-click menu. These actions refer to the complete image at its physical
 pixel dimensions, including pictures spanning multiple rendering surfaces.
 The app does not cancel `contextmenu` or replace it with a custom menu.
 
@@ -269,16 +349,46 @@ temporarily needs another image's memory; after replacement, the canvas backing
 stores are released. PNG bytes, browser image decoding and existing image data
 still require memory proportional to the output size.
 
-The local object URL stays valid while its image is displayed and through an
-active drag, even if resizing replaces that image. Removed images release their
-URLs after the drag ends. Chromium also receives a `DownloadURL` filename hint,
-such as `mandelbrot-3840x2160.png`, while its ordinary image drag payload remains
-intact. Other browsers choose their own suggested filename; Safari may suggest
-`Unknown`. Native file-system drag behavior depends on the browser and OS, as
-described in [MDN's drag data documentation](https://developer.mozilla.org/en-US/docs/Web/API/HTML_Drag_and_Drop_API/Drag_data_store).
-No image is uploaded, and PNG generation and image actions work offline.
+The local object URL remains valid while its image is displayed. Removed images
+release their URLs. Native image file dragging is disabled so mouse/touch drag
+can move the region. No image is uploaded, and PNG generation and image actions
+work offline.
 The `mandelbrot-export` event reports dimensions, filename and byte size to the
 developer test page without adding visible app UI.
+
+### Interactive zoom measurements
+
+On 14 October 2026, the Codex in-app browser on macOS 27.0.1, Apple M5 Pro
+(Virtual), DPR 2 and eight workers produced these warm medians of three frames
+after one warm-up frame per case:
+
+| View | 3840 × 2160 (4K) | 7680 × 4320 (8K) | Iteration budget, 4K / 8K |
+| --- | ---: | ---: | ---: |
+| Complete figure | 35.4 ms | 150.4 ms | 768 / 1024 |
+| Seahorse region, `2^10` zoom | 103.8 ms | 381.2 ms | 3328 / 3584 |
+| Around `c = i`, `2^40` zoom | 468.7 ms | 1633.2 ms | 11008 / 11264 |
+| Around `c = i`, `2^400` zoom | 19.984 s | 72.749 s | 103168 / 103424 |
+
+The first two rows use SIMD. The third uses tile references, series approximation
+and the double-double/fixed-point fallbacks. The fourth uses the shared
+reference and scaled perturbation/BLA pipeline. In the last row, approximately
+2.21 billion / 8.86 billion iterations were skipped, but 213,893 / 855,836 pixels
+still required fixed-point fallback. Those pixels dominate the total time;
+reference preparation itself took about 13–14 ms.
+
+Times include reference preparation, tile computation, canvas allocation,
+worker transfers and final pixel display. They exclude the subsequent PNG
+preparation and actual compositor presentation. The 150 ms wheel idle interval
+is also excluded. Request-to-frame times and all individual samples are in
+[the machine-readable measurement record](docs/zoom-benchmark.json).
+
+These are selected fixed regions, not a universal relationship between zoom
+and runtime. The preperiodic reference `c = i` is particularly useful for testing
+extended exponents. A different seahorse region at `2^40` needed many more
+fixed-point calculations during development and was substantially slower.
+Arbitrary-precision deep zoom is available, but it is not uniformly interactive
+at full 4K or 8K resolution. Interrupting a long calculation by moving or
+zooming remains supported. A physical iPhone was not available for testing.
 
 ### Measurements
 
@@ -342,8 +452,11 @@ evidence for these inputs, not a general guarantee for fast-math arithmetic.
   partial edge tiles, against an independent native orbit without shortcuts;
 - additional 4K/8K boundary tiles with larger budgets and exact cycle detection;
 - byte-for-byte agreement of scalar and SIMD WASM with those native references;
-- zero WASM imports, ABI version and bounded fixed memory;
-- deterministic resize scheduling checks: deadlines, deferred gestures, latest
+- zero WASM imports, ABI version, fixed tile storage and dynamic deep-zoom memory;
+- deep scalar/SIMD rendering against independent BigInt orbits through `2^1600`,
+  fixed-point arithmetic, scaled exponents, approximation/fallback agreement and
+  coordinate navigation that remains effective after ordinary double underflow;
+- deterministic resize and navigation scheduling checks: deadlines, deferred gestures, latest
   size selection, reuse, stale generations, idle timing and disposal;
 - JavaScript syntax and completeness of the generated offline package;
 - decoded icon dimensions, transparency, every ICO frame, maskable safe zones,
@@ -368,11 +481,14 @@ icons, favicon and Apple Touch links, and stable aliases against the controlling
 release. It also works after stopping the local server.
 
 The image-export controls decode and compare every PNG pixel against scalar
-WASM, check the complete-image MIME type and dimensions, native context-menu
-and drag defaults, filename hints, and object-URL lifetime across an active drag
-and resize. Additional independent pixel patterns exercise native compression
+WASM, check the complete-image MIME type and dimensions, the native context menu,
+canceled image dragging and object-URL release after resizing. Additional independent pixel patterns exercise native compression
 and stored-DEFLATE strips, including odd dimensions and 65,535-byte block edges.
 The large-export control checks all decoded pixels at 4K and 8K.
+The additional `/internal/tests/browser/zoom.html` page verifies zoomed PNGs,
+wheel and two-touch input, deep frames at `2^400` and `2^1600`, and provides the
+4K/8K benchmark for multiple fixed regions. Its programmatic `setView` helper
+is a developer API and adds no controls to the app.
 The fullscreen check arms a real image click, verifies the complete PNG against
 scalar WASM after entering fullscreen, exits automatically after ten seconds,
 then checks the restored embedded viewport. Its iframe explicitly allows fullscreen.
@@ -416,6 +532,17 @@ scalar WASM. Fullscreen stayed active through PNG replacement; leaving it also
 produced a fresh, pixel-verified frame at the restored viewport size.
 Physical mobile devices, standalone Chrome/Firefox, an Intel build host and a
 machine with only CLT installed were not tested.
+
+The interactive-zoom implementation was additionally checked on the same host
+on 14 October 2026. `make check` passed with 1,129 native deep pixel comparisons
+and 48 independent BigInt sample comparisons from complete 33 × 17 WASM tiles
+through `2^1600` (RGB tolerance: one 8-bit level; matching interior/exterior
+classification). The browser checks passed for wheel and synthetic two-touch
+pinch, zoomed PNG equality, real mouse panning, fullscreen entry/exit,
+full 4K/8K PNG equality and adaptive live resize. With the server stopped,
+reloading, resizing and wheel zoom with fresh PNG preparation also passed.
+There was no physical iPhone available; native Safari trackpad gesture handling
+was implemented but not exercised on Safari in this run.
 
 ## Source layout
 

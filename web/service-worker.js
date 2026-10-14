@@ -5,7 +5,7 @@ const CACHE = `${PREFIX}${RELEASE}`;
 const INVENTORY = new URL(`releases/${RELEASE}/offline-resources.json`, BASE).href;
 const COMPLETE = new URL(`.offline-complete-${RELEASE}`, BASE).href;
 const INDEX = new URL(`releases/${RELEASE}/index.html`, BASE).href;
-const REQUIRED = ['index.html', 'app.js', 'resize-scheduler.js', 'image-export.js', 'png-worker.js', 'engine-worker.js', 'engine-scalar.wasm', 'engine-simd.wasm', 'XCC-LICENSE.txt',
+const REQUIRED = ['index.html', 'app.js', 'resize-scheduler.js', 'image-export.js', 'png-worker.js', 'engine-worker.js', 'view.js', 'navigation.js', 'reference-worker.js', 'engine-scalar.wasm', 'engine-simd.wasm', 'XCC-LICENSE.txt',
   'site.webmanifest', 'favicon.ico', 'favicon-16.png', 'favicon-32.png', 'favicon-48.png',
   'apple-touch-icon-152.png', 'apple-touch-icon-167.png', 'apple-touch-icon.png',
   'icon-192.png', 'icon-512.png', 'icon-1024.png', 'icon-maskable-512.png', 'icon-maskable-1024.png'];

@@ -1,0 +1,76 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Mandelbrot zoom checks</title>
+<style>body{margin:24px;background:#16181d;color:white;font:14px system-ui}button{padding:8px;margin:0 8px 12px 0}pre{white-space:pre-wrap}#host{position:relative;width:640px;height:360px;overflow:hidden;background:black;touch-action:none}.frame{position:absolute;inset:0;overflow:hidden;background:black}canvas{position:absolute;display:block}</style>
+<h1>Mandelbrot zoom checks</h1><button id="check">Check zoom and navigation</button><button id="benchmark">Benchmark 4K / 8K views</button><button id="deep">Show extreme zoom</button><pre id="report"></pre><div id="host"></div>
+<script type="module">
+const host=document.getElementById('host'),output=document.getElementById('report');
+const records=[];const log=x=>{records.push(x);output.textContent+=(typeof x==='string'?x:JSON.stringify(x))+'\n';};
+const assert=(x,m)=>{if(!x)throw new Error(m);};const delay=ms=>new Promise(r=>setTimeout(r,ms));
+const release=(await(await fetch('/web/release.txt')).text()).trim();host.dataset.release=release;
+const renderer=await import(`/web/releases/${release}/app.js`);
+let app=await renderer.start(host);
+function completed(action,timeout=300000){return new Promise((resolve,reject)=>{
+  const timer=setTimeout(()=>{host.removeEventListener('mandelbrot-frame',listener);reject(new Error('Frame timed out'));},timeout);
+  const started=performance.now();
+  function listener(event){if(event.detail.phase!=='final')return;clearTimeout(timer);host.removeEventListener('mandelbrot-frame',listener);resolve({...event.detail,requestMilliseconds:performance.now()-started});}
+  host.addEventListener('mandelbrot-frame',listener);action?.();
+});}
+async function exported(){for(let j=0;j<6000;++j){const image=host.querySelector('img.export-image');if(image&&host.dataset.exportState==='ready')return image;await delay(10);}throw new Error('PNG timed out');}
+async function verifyShallow(){
+  const image=await exported(),view=app.getView(),width=image.naturalWidth,height=image.naturalHeight;
+  const e=(await WebAssembly.instantiate(await(await fetch(`/web/releases/${release}/engine-scalar.wasm`)).arrayBuffer(),{})).instance.exports;
+  e.configure_view(width,height,view.centreReal,view.centreImag,view.mantissa*2**view.exponent,view.iterations);
+  for(let y=0;y<height;y+=64)for(let x=0;x<width;x+=256){
+    const w=Math.min(256,width-x),h=Math.min(64,height-y),canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
+    const ctx=canvas.getContext('2d');ctx.drawImage(image,x,y,w,h,0,0,w,h);
+    const actual=ctx.getImageData(0,0,w,h).data;e.render_tile(x,y,w,h);
+    const expected=new Uint8Array(e.memory.buffer,e.output_address(),actual.length);
+    assert(actual.every((v,j)=>v===expected[j]),`Zoomed PNG pixel mismatch at ${x},${y}`);
+  }
+  assert(image.draggable===false,'Native image drag competes with pan');
+  log(`PASS: zoomed ${width}x${height} PNG matches scalar WASM at every pixel.`);
+}
+document.getElementById('check').onclick=async()=>{try{
+  await completed(()=>app.setView({real:'-0.75',imag:'0.1',zoom:7}));await verifyShallow();
+  const first=app.getView();
+  const rectangle=host.getBoundingClientRect();
+  await completed(()=>host.dispatchEvent(new WheelEvent('wheel',{clientX:rectangle.left+230,clientY:rectangle.top+140,deltaY:-80,cancelable:true,bubbles:true})));
+  assert(app.getView().zoom>first.zoom,'Wheel did not zoom');await verifyShallow();
+  const before=app.getView();
+  await completed(()=>{
+    host.dispatchEvent(new PointerEvent('pointerdown',{pointerId:91,button:0,pointerType:'touch',clientX:rectangle.left+200,clientY:rectangle.top+150,bubbles:true}));
+    host.dispatchEvent(new PointerEvent('pointerdown',{pointerId:92,button:0,pointerType:'touch',clientX:rectangle.left+300,clientY:rectangle.top+150,bubbles:true}));
+    host.dispatchEvent(new PointerEvent('pointermove',{pointerId:92,pointerType:'touch',clientX:rectangle.left+400,clientY:rectangle.top+150,bubbles:true}));
+    host.dispatchEvent(new PointerEvent('pointerup',{pointerId:91,pointerType:'touch',bubbles:true}));
+    host.dispatchEvent(new PointerEvent('pointerup',{pointerId:92,pointerType:'touch',bubbles:true}));
+  });
+  assert(Math.abs(app.getView().zoom-before.zoom-1)<1e-10,'Pinch scale incorrect');await verifyShallow();
+  const deep=await completed(()=>app.setView({real:'0',imag:'1',zoom:400}));
+  assert(deep.deep && deep.skippedIterations>0,'Deep acceleration failed');log({check:'deep zoom',...deep});
+  await exported();const at=app.getView();
+  host.style.width='96px';host.style.height='64px';
+  await completed(()=>app.setView({real:'0',imag:'1',zoom:1600}));await exported();
+  assert(app.getView().bits>1600 && host.dataset.state==='complete','Extreme exponent failed');
+  host.style.width='640px';host.style.height='360px';
+  await completed(()=>app.setView({real:'-0.75',imag:'0.1',zoom:7}));
+  log('PASS: wheel, two-touch pinch, current-view PNG, same-size invalidation and zooms 2^400 / 2^1600.');
+}catch(e){log(`FAIL: ${e.message}`);}};
+document.getElementById('benchmark').onclick=async()=>{try{
+  const cases=[{name:'overview',real:'-0.75',imag:'0',zoom:0},
+    {name:'seahorse 2^10',real:'-0.743643887037151',imag:'0.13182590420533',zoom:10},
+    {name:'preperiodic c=i 2^40',real:'0',imag:'1',zoom:40},
+    {name:'preperiodic c=i 2^400',real:'0',imag:'1',zoom:400}];
+  for(const target of cases)for(const [width,height]of[[3840,2160],[7680,4320]]){
+    host.style.width=`${width/devicePixelRatio}px`;host.style.height=`${height/devicePixelRatio}px`;
+    await completed(()=>app.setView(target));const samples=[];
+    for(let repeat=0;repeat<3;++repeat){await delay(30);samples.push(await completed(()=>app.setView(target)));}
+    const times=samples.map(x=>x.milliseconds).sort((a,b)=>a-b),requests=samples.map(x=>x.requestMilliseconds).sort((a,b)=>a-b);
+    log({benchmark:target.name,width,height,zoom:target.zoom,iterations:samples[0].iterations,deep:samples[0].deep,algorithm:samples[0].algorithm,
+      medianMilliseconds:times[1],medianRequestMilliseconds:requests[1],samples:times,referenceMilliseconds:samples.map(x=>x.referenceMilliseconds),
+      skippedIterations:samples[0].skippedIterations,preciseFallbacks:samples[0].preciseFallbacks,workers:samples[0].workers,dpr:devicePixelRatio});
+  }
+  host.style.width='640px';host.style.height='360px';await completed(()=>app.setView({real:'0',imag:'1',zoom:40}));
+  log('BENCHMARK COMPLETE');
+}catch(e){log(`FAIL: ${e.message}`);}};
+document.getElementById('deep').onclick=()=>app.setView({real:'0',imag:'1',zoom:400});
+log('READY: renderer initialized.');
+</script></html>

@@ -1,11 +1,14 @@
 import {createResizeScheduler} from './resize-scheduler.js';
 import {createImageExport} from './image-export.js';
+import {createView, previewTransform} from './view.js';
+import {createNavigation} from './navigation.js';
 
 const TILE_WIDTH = 256, TILE_HEIGHT = 64, SURFACE_SIZE = 1024;
 
 export async function start(root) {
   let disposed = false, pending, frameRequest = 0;
-  let physicalSize, replacementCount = 0, fullscreenPending = false;
+  let physicalSize, replacementCount = 0, fullscreenPending = false, referenceWorker;
+  const view = createView(root._mandelbrotView);
   const slots = [];
   const simdBytes = await loadBytes('engine-simd.wasm');
   const backend = WebAssembly.validate(simdBytes) ? 'simd128' : 'scalar';
@@ -27,6 +30,7 @@ export async function start(root) {
       root.dispatchEvent(new CustomEvent('mandelbrot-resize', {bubbles: true, detail}));
     }
   });
+  const navigation = createNavigation(root, view, active => { scheduler.hold(active); resize(); });
 
   function newSlot() {
     return new Promise((resolve, reject) => {
@@ -52,6 +56,8 @@ export async function start(root) {
           surface.context.putImageData(new ImageData(pixels, data.width, data.height),
             data.x % SURFACE_SIZE, data.y % SURFACE_SIZE);
           ++pending.completed;
+          pending.skipped = (pending.skipped || 0) + (data.skipped || 0);
+          pending.fallbacks = (pending.fallbacks || 0) + (data.fallbacks || 0);
           if (pending.completed === pending.total) finish();
         }
         dispatch(slot, data.buffer);
@@ -85,9 +91,17 @@ export async function start(root) {
       const index = pending.next++, cols = Math.ceil(pending.width / TILE_WIDTH);
       const x = (index % cols) * TILE_WIDTH, y = Math.floor(index / cols) * TILE_HEIGHT;
       job = {type: 'render', generation: pending.id, frameWidth: pending.width, frameHeight: pending.height,
+        view: pending.view,
         x, y, width: Math.min(TILE_WIDTH, pending.width - x), height: Math.min(TILE_HEIGHT, pending.height - y)};
     }
+    if (pending.view.perturb && !pending.reference) { pending.retry.push(job); return; }
+    if (pending.view.perturb && slot.referenceGeneration !== pending.id) {
+      slot.worker.postMessage({type: 'reference', generation: pending.id, bits: pending.reference.bits,
+        view: pending.view, buffer: pending.reference.buffer});
+      slot.referenceGeneration = pending.id;
+    }
     slot.busy = true; slot.job = job;
+    if (pending.view.deep) slot.memoryIterations = Math.max(slot.memoryIterations || 0,pending.view.iterations);
     const transfer = slot.buffer; slot.buffer = null;
     slot.worker.postMessage({...job, buffer: transfer}, transfer ? [transfer] : []);
   }
@@ -95,6 +109,7 @@ export async function start(root) {
   function reveal(frame) {
     if (disposed || pending !== frame || frame.shown) return;
     frame.shown = true; frame.layer.style.visibility = 'visible';
+    frame.layer.style.transform = previewTransform(frame.view, currentView(), root.clientWidth, root.clientHeight);
     for (const child of [...root.children]) if (child !== frame.layer) child.remove();
     root.dataset.exportState = 'pending';
   }
@@ -106,7 +121,11 @@ export async function start(root) {
     root.dataset.state = 'complete';
     root.dispatchEvent(new CustomEvent('mandelbrot-frame', {bubbles: true, detail: {
       width: frame.width, height: frame.height, milliseconds: performance.now() - frame.started,
-      backend, workers: slots.length, phase: frame.kind
+      backend, workers: slots.length, phase: frame.kind,
+      zoom: frame.view.zoom, iterations: frame.view.iterations, deep: frame.view.deep,
+      algorithm: frame.view.perturb ? 'perturbation/BLA' : frame.view.deep ? 'tile perturbation/BLA + double-double' : backend,
+      referenceMilliseconds: frame.reference?.milliseconds || 0,
+      skippedIterations: frame.skipped || 0, preciseFallbacks: frame.fallbacks || 0
     }}));
     if (frame.kind === 'final') imageExport.prepare(frame);
   }
@@ -121,6 +140,10 @@ export async function start(root) {
     if (pending?.id !== id) return;
     clearTimeout(pending.revealTimer);
     if (!pending.shown) pending.layer.remove();
+    referenceWorker?.terminate(); referenceWorker = null;
+    if (!disposed && pending.view.deep) for (const slot of [...slots]) if (slot.job?.generation === id) {
+      slot.worker.terminate(); slots.splice(slots.indexOf(slot),1); newSlot().catch(fail);
+    }
     pending = null;
   }
 
@@ -132,6 +155,7 @@ export async function start(root) {
       if (!pending.shown) pending.layer.remove();
     }
     const layer = document.createElement('div'); layer.className = 'frame';
+    layer._view = size.view;
     layer.style.visibility = 'hidden';
     const surfaces = new Map();
     for (let y = 0; y < size.height; y += SURFACE_SIZE) {
@@ -153,8 +177,31 @@ export async function start(root) {
       total: Math.ceil(size.width / TILE_WIDTH) * Math.ceil(size.height / TILE_HEIGHT), started: job.started};
     root.dataset.state = 'rendering';
     root.dataset.phase = job.kind;
+    root.dataset.zoom = String(size.view.zoom);
+    root.dataset.iterations = String(size.view.iterations);
+    root.dataset.deep = String(size.view.deep);
+    for (const slot of [...slots]) if (slot.memoryIterations &&
+        (!size.view.deep || size.view.iterations*2 < slot.memoryIterations)) {
+      slot.worker.terminate(); slots.splice(slots.indexOf(slot),1); newSlot().catch(fail);
+    }
     const frame = pending;
-    if (job.kind === 'final') frame.revealTimer = setTimeout(() => reveal(frame), 500);
+    // During navigation retain the complete transformed picture until the new
+    // view is complete. Initial/window resize retain the existing presentation.
+    if (job.kind === 'final' && !size.view.revision) frame.revealTimer = setTimeout(() => reveal(frame), 500);
+    if (size.view.perturb) {
+      referenceWorker?.terminate();
+      const worker = new Worker(new URL('./reference-worker.js', import.meta.url), {type:'module'});
+      referenceWorker = worker;
+      worker.onmessage = ({data}) => {
+        if (disposed || pending !== frame || data.generation !== frame.id) return;
+        if (data.type === 'error') { fail(new Error(data.message)); return; }
+        frame.reference = data; worker.terminate(); if (referenceWorker === worker) referenceWorker = null;
+        for (const slot of slots) dispatch(slot);
+      };
+      worker.onerror = event => fail(new Error(event.message || 'Reference worker failed'));
+      worker.postMessage({type:'init',module});
+      worker.postMessage({type:'prepare',generation:frame.id,view:frame.view,width:frame.width,height:frame.height});
+    }
     for (const slot of slots) dispatch(slot);
   }
 
@@ -166,11 +213,21 @@ export async function start(root) {
       const exact = physicalSize && physicalSize.dpr === dpr && physicalSize.cssWidth === rect.width &&
         physicalSize.cssHeight === rect.height ? physicalSize : null;
       try {
+        const width = exact ? exact.width : Math.round(rect.width*dpr);
+        if (!rect.width || !rect.height || !width) {
+          scheduler.update({width:0,height:0,cssWidth:rect.width,cssHeight:rect.height}); return;
+        }
+        const height=exact ? exact.height : Math.round(rect.height*dpr);
+        const target = view.snapshot(rect.width,rect.height,width,height);
+        root._mandelbrotView=target;
+        for (const child of root.children) if (child.style.visibility !== 'hidden' && child._view)
+          child.style.transform = previewTransform(child._view,target,rect.width,rect.height);
         scheduler.update({width: exact ? exact.width : Math.round(rect.width * dpr),
-          height: exact ? exact.height : Math.round(rect.height * dpr), cssWidth: rect.width, cssHeight: rect.height});
+          height: exact ? exact.height : Math.round(rect.height * dpr), cssWidth: rect.width, cssHeight: rect.height, view: target});
       } catch (error) { fail(error); }
     });
   }
+  function currentView() { const r=root.getBoundingClientRect();return view.snapshot(r.width,r.height,Math.round(r.width*(devicePixelRatio||1))); }
 
   const observer = new ResizeObserver(entries => {
     const entry = entries[0], box = entry.devicePixelContentBoxSize?.[0];
@@ -187,7 +244,9 @@ export async function start(root) {
   }
   function resume() { if (!document.hidden) { physicalSize = null; resize(); } }
   function enterFullscreen(event) {
-    if (disposed || event.button !== 0 || !event.target.closest('canvas, img.export-image') ||
+    const pictureTarget = event.target.closest('canvas, img.export-image') ||
+      (event.target === root && root.querySelector('canvas, img.export-image'));
+    if (disposed || navigation.suppressClick() || event.button !== 0 || !pictureTarget ||
         document.fullscreenElement || fullscreenPending || !document.fullscreenEnabled || !root.requestFullscreen) return;
     fullscreenPending = true;
     // Keep the stable viewport element fullscreen while tiles/PNGs are replaced.
@@ -208,6 +267,7 @@ export async function start(root) {
     disposed = true; observer.disconnect(); cancelAnimationFrame(frameRequest);
     scheduler.dispose();
     imageExport.dispose();
+    navigation.dispose(); referenceWorker?.terminate();
     clearTimeout(pending?.revealTimer);
     if (pending && !pending.shown) pending.layer.remove();
     densityQuery?.removeEventListener('change', densityChanged);
@@ -223,7 +283,8 @@ export async function start(root) {
   window.addEventListener('resize', resize); document.addEventListener('visibilitychange', resume);
   root.addEventListener('click', enterFullscreen); document.addEventListener('fullscreenchange', fullscreenChanged);
   densityChanged();
-  return {dispose, backend};
+  return {dispose, backend, setView: target => { view.set(target); scheduler.hold(true); resize();
+    requestAnimationFrame(() => scheduler.hold(false)); }, getView: currentView, reset: () => { view.reset(); resize(); }};
 }
 
 async function loadBytes(name) {

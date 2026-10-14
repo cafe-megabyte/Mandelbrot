@@ -4,7 +4,7 @@
 #endif
 
 static unsigned frame_width, frame_height, limit;
-static double step, half_width, half_height;
+static double step, half_width, half_height, centre_real = -0.75, centre_imag;
 static _Alignas(16) uint32_t output[MANDELBROT_TILE_PIXELS];
 static uint32_t palette[4096];
 static int palette_ready;
@@ -52,10 +52,19 @@ unsigned configure(unsigned width, unsigned height) {
     half_width = 0.5 * width; half_height = 0.5 * height;
     double sx = 3.0 / width, sy = 2.5 / height;
     step = sx > sy ? sx : sy;
+    centre_real = -0.75; centre_imag = 0;
     limit = 512;
     for (double threshold = 1.0 / 512.0; step < threshold && limit < 8192; threshold *= 0.5)
         limit += 256;
     if (!palette_ready) prepare_palette();
+    return limit;
+}
+unsigned configure_view(unsigned width, unsigned height, double real, double imag, double spacing, unsigned iterations) {
+    if (!configure(width, height) || !__builtin_isfinite(real) || !__builtin_isfinite(imag) ||
+        !__builtin_isfinite(spacing) || spacing <= 0 || !iterations || iterations > INT32_MAX) {
+        frame_width = 0; return 0;
+    }
+    centre_real = real; centre_imag = imag; step = spacing; limit = iterations;
     return limit;
 }
 unsigned iteration_limit(void) { return limit; }
@@ -75,7 +84,7 @@ static inline int known_interior(double cr, double ci) {
 static inline uint32_t colour(unsigned n, double magnitude) {
     if (n == limit) return UINT32_C(0xff000000);
     double smooth = n + 1.0 - colour_log2(0.5 * colour_log2(magnitude));
-    unsigned index = (unsigned)(int32_t)__builtin_floor(smooth * 96.0) & 4095u;
+    unsigned index = (unsigned)(int64_t)__builtin_floor(smooth * 96.0) & 4095u;
     return palette[index];
 }
 
@@ -158,17 +167,17 @@ unsigned render_tile(unsigned tx, unsigned ty, unsigned width, unsigned height) 
         tx > frame_width - width || ty > frame_height - height) return 0;
     uint32_t *dst = output;
     for (unsigned row = 0; row < height; ++row) {
-        double ci = (half_height - ((double)(ty + row) + 0.5)) * step;
+        double ci = centre_imag + (half_height - ((double)(ty + row) + 0.5)) * step;
         unsigned col = 0;
 #if defined(__wasm_simd128__)
         for (; col + 1 < width; col += 2) {
-            double cr0 = -0.75 + (((double)(tx + col) + 0.5) - half_width) * step;
-            double cr1 = -0.75 + (((double)(tx + col + 1) + 0.5) - half_width) * step;
+            double cr0 = centre_real + (((double)(tx + col) + 0.5) - half_width) * step;
+            double cr1 = centre_real + (((double)(tx + col + 1) + 0.5) - half_width) * step;
             pixel_pair(cr0, cr1, ci, dst); dst += 2;
         }
 #endif
         for (; col < width; ++col) {
-            double cr = -0.75 + (((double)(tx + col) + 0.5) - half_width) * step;
+            double cr = centre_real + (((double)(tx + col) + 0.5) - half_width) * step;
             *dst++ = scalar_pixel(cr, ci);
         }
     }
