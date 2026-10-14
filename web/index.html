@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <meta name="description" content="A full-resolution Mandelbrot set, computed locally with WebAssembly SIMD and available offline.">
+  <title>Mandelbrot</title>
+  <meta name="application-name" content="Mandelbrot">
+  <meta name="apple-mobile-web-app-title" content="Mandelbrot">
+  <link rel="icon" href="releases/__RELEASE__/favicon.ico" sizes="16x16 32x32 48x48 64x64 128x128 256x256">
+  <link rel="icon" type="image/png" sizes="16x16" href="releases/__RELEASE__/favicon-16.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="releases/__RELEASE__/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="48x48" href="releases/__RELEASE__/favicon-48.png">
+  <link rel="apple-touch-icon" sizes="152x152" href="releases/__RELEASE__/apple-touch-icon-152.png">
+  <link rel="apple-touch-icon" sizes="167x167" href="releases/__RELEASE__/apple-touch-icon-167.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="releases/__RELEASE__/apple-touch-icon.png">
+  <link rel="manifest" href="site.webmanifest">
+  <style>
+    html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#000;color-scheme:dark}
+    #fractal{position:fixed;inset:0;overflow:hidden;background:#000}
+    .frame{position:absolute;inset:0;overflow:hidden;background:#000}
+    canvas{position:absolute;display:block}
+  </style>
+</head>
+<body>
+  <main id="fractal" role="img" aria-label="A colourful Mandelbrot set"></main>
+  <script type="module">
+    // The shell stays black until the controlling worker verifies its complete
+    // offline package. Runtime imports always use THAT worker's release.
+    const DOCUMENT_RELEASE = '__RELEASE__';
+    const root = document.getElementById('fractal');
+    const base = new URL('./', location.href);
+    let registration, instance, activeRelease, running = false, requested = false;
+
+    function status(worker, repair = false) {
+      return new Promise((resolve, reject) => {
+        const channel = new MessageChannel();
+        const timer = setTimeout(() => { channel.port1.close(); reject(new Error('Offline verification timed out')); }, 20000);
+        channel.port1.onmessage = ({data}) => { clearTimeout(timer); channel.port1.close(); resolve(data); };
+        worker.postMessage({type: repair ? 'repair' : 'status'}, [channel.port2]);
+      });
+    }
+    async function refresh() {
+      requested = true;
+      if (running) return;
+      running = true;
+      try {
+        while (requested) {
+          requested = false;
+          const controller = navigator.serviceWorker.controller;
+          if (!controller) continue;
+          let state = await status(controller);
+          if (!state.ready && navigator.onLine) state = await status(controller, true);
+          if (!state.ready || !/^[a-f0-9-]{36}$/.test(state.release)) continue;
+          if (navigator.serviceWorker.controller !== controller) { requested = true; continue; }
+          if (state.release === activeRelease) continue;
+          const app = await import(new URL(`releases/${state.release}/app.js`, base));
+          const next = await app.start(root);
+          if (navigator.serviceWorker.controller !== controller) { next.dispose(); requested = true; continue; }
+          instance?.dispose(); instance = next; activeRelease = state.release;
+          root.dataset.release = activeRelease;
+        }
+      } catch (error) { console.error('Mandelbrot startup:', error); }
+      finally { running = false; }
+    }
+    function update() {
+      if (!document.hidden) {
+        registration?.update().catch(error => console.debug('Mandelbrot update:', error.message));
+        refresh();
+      }
+    }
+    if ('serviceWorker' in navigator && isSecureContext) {
+      navigator.serviceWorker.addEventListener('controllerchange', refresh);
+      navigator.serviceWorker.addEventListener('message', ({data}) => { if (data?.type === 'offline-ready') refresh(); });
+      window.addEventListener('online', update);
+      window.addEventListener('pageshow', update);
+      document.addEventListener('visibilitychange', update);
+      setInterval(update, 5 * 60 * 1000);
+      try {
+        registration = await navigator.serviceWorker.register(new URL('service-worker.js', base),
+          {scope: base.pathname, updateViaCache: 'none'});
+        await navigator.serviceWorker.ready;
+        update();
+      } catch (error) { console.error('Mandelbrot offline installation:', error); }
+    } else console.error('Mandelbrot requires HTTPS or localhost and Service Worker support.');
+  </script>
+</body>
+</html>

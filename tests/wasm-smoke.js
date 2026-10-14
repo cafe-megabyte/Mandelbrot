@@ -1,0 +1,11 @@
+const wasmModule = new WebAssembly.Module(new Uint8Array(moduleBytes));
+if (WebAssembly.Module.imports(wasmModule).length) throw new Error('WASM must have zero imports');
+const engine = new WebAssembly.Instance(wasmModule, {}).exports;
+if (engine.abi_version() !== 1 || engine.tile_width() !== 256 || engine.tile_height() !== 64) throw new Error('WASM ABI mismatch');
+if (engine.configure(0,1) || engine.render_tile(0,0,1,1)) throw new Error('Invalid viewport accepted');
+if (engine.configure(3,3) !== 512 || engine.render_tile(1,1,1,1) !== 4) throw new Error('WASM render failed');
+const pixel = new Uint8Array(engine.memory.buffer, engine.output_address(), 4);
+if (pixel.join(',') !== '0,0,0,255') throw new Error('Known interior must be opaque black');
+if (engine.memory.buffer.byteLength > 262144) throw new Error('Unexpected fixed WASM memory');
+report('WASM ABI, zero imports, fixed tile memory and known pixel passed.');
+var testDone = true;

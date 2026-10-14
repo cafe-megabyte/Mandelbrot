@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>O3 / Ofast Mandelbrot benchmark</title>
+<style>body{font:14px system-ui;background:#16181d;color:#eee;margin:24px}button{padding:10px}pre{white-space:pre-wrap}</style>
+<h1>O3 / Ofast Mandelbrot benchmark</h1>
+<p>Identical source, compiler, linker, viewport and iteration budget. Five warm samples, alternating variant order. No canvas or worker transfers inside the timed region.</p>
+<button id="run">Run 4K and 8K comparison</button>
+<pre id="report"></pre>
+<script type="module">
+const report=document.getElementById('report'),button=document.getElementById('run');
+const log=value=>report.textContent+=`${JSON.stringify(value)}\n`;
+const yieldUI=()=>new Promise(resolve=>setTimeout(resolve,0));
+function render(e,w,h){for(let y=0;y<h;y+=64)for(let x=0;x<w;x+=256)e.render_tile(x,y,Math.min(256,w-x),Math.min(64,h-y));}
+button.onclick=async()=>{
+  button.disabled=true;document.body.dataset.state='running';report.textContent='';
+  try{
+    const engines=new Map();
+    for(const name of ['accurate-scalar','fast-scalar','accurate-simd','fast-simd']){
+      const response=await fetch(`/internal/bench/${name}.wasm`);if(!response.ok)throw new Error(`Missing ${name}`);
+      const module=await WebAssembly.compile(await response.arrayBuffer());
+      if(WebAssembly.Module.imports(module).length)throw new Error('Unexpected imports');
+      const e=new WebAssembly.Instance(module,{}).exports;engines.set(name,e);
+      e.configure(1920,1080);render(e,1920,1080);
+    }
+    for(const [w,h]of[[3840,2160],[7680,4320]]){
+      const times=new Map([...engines.keys()].map(name=>[name,[]]));
+      for(const e of engines.values()){e.configure(w,h);render(e,w,h);await yieldUI();}
+      for(let repeat=0;repeat<5;++repeat){
+        const names=[...engines.keys()];if(repeat%2)names.reverse();
+        for(const name of names){
+          await yieldUI();const e=engines.get(name),start=performance.now();render(e,w,h);times.get(name).push(performance.now()-start);
+        }
+      }
+      for(const [name,samples]of times){
+        samples.sort((a,b)=>a-b);log({name,width:w,height:h,iterations:engines.get(name).iteration_limit(),medianMilliseconds:samples[2],samples});
+      }
+      const accurate=engines.get('accurate-simd'),fast=engines.get('fast-simd');
+      let differentPixels=0,differentMembership=0;
+      for(let y=0;y<h;y+=64){
+        await yieldUI();
+        for(let x=0;x<w;x+=256){
+          const tw=Math.min(256,w-x),th=Math.min(64,h-y);
+          accurate.render_tile(x,y,tw,th);fast.render_tile(x,y,tw,th);
+          const a=new Uint32Array(accurate.memory.buffer,accurate.output_address(),tw*th);
+          const b=new Uint32Array(fast.memory.buffer,fast.output_address(),tw*th);
+          for(let i=0;i<a.length;++i)if(a[i]!==b[i]){++differentPixels;if((a[i]===0xff000000)!==(b[i]===0xff000000))++differentMembership;}
+        }
+      }
+      log({comparison:'SIMD output',width:w,height:h,pixels:w*h,differentPixels,differentMembership});
+    }
+    document.body.dataset.state='complete';
+  }catch(error){log({error:error.message});document.body.dataset.state='failed';}
+  finally{button.disabled=false;}
+};
+</script>
+</html>

@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Mandelbrot browser checks</title>
+<style>
+body{font:14px system-ui;background:#16181d;color:#eee;margin:24px}button{margin:0 8px 12px 0;padding:8px}
+iframe{display:block;border:0;background:#000;width:320px;height:180px}pre{white-space:pre-wrap}
+#slow{position:relative;width:320px;height:180px;overflow:hidden;background:#000}.frame{position:absolute;inset:0;background:#000;overflow:hidden}canvas{position:absolute;display:block}
+</style>
+<h1>Mandelbrot browser checks</h1>
+<p>This developer-only page is excluded from the offline website.</p>
+<button id="run">Run pixel and resize checks</button>
+<button id="slow-test">Test adaptive presentation</button>
+<button id="adaptive-resize">Test adaptive live resize</button>
+<button id="image-export">Test full-image PNG and drag data</button>
+<button id="offline-icons">Test offline icons and manifest</button>
+<button id="large-export">Test 4K / 8K PNG export</button>
+<button id="fullscreen-test">Arm fullscreen click check</button>
+<button id="reload">Reload app (also works with server stopped)</button>
+<button id="resize">Resize app without network</button>
+<button id="update">Check for update</button>
+<button id="benchmark">Benchmark HD / 4K / 8K</button>
+<button id="core-benchmark">Benchmark scalar / SIMD core</button>
+<button id="gate">Test incomplete offline installation</button>
+<button id="fixture">Open update fixture</button>
+<button id="retry-gate">Retry restored installation</button>
+<button id="stress">Stress rapid resizing</button>
+<button id="repair">Test cache repair in fixture</button>
+<pre id="report"></pre>
+<iframe id="app" title="Mandelbrot under test" src="/web/" allowfullscreen></iframe>
+<div id="slow"></div>
+<script type="module">
+const frame=document.getElementById('app'), report=document.getElementById('report');
+let lastFrame, scalarModule, scalarRelease, resizeCount=0, loadCount=0;
+let fullscreenTest=false, fullscreenTimer;
+const log=value=>{report.textContent+=`${typeof value==='string'?value:JSON.stringify(value)}\n`;};
+const assert=(condition,message)=>{if(!condition)throw new Error(message);};
+const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+frame.addEventListener('load',()=>{
+  log({event:'navigation',count:++loadCount});
+  frame.contentDocument.addEventListener('mandelbrot-frame',event=>{lastFrame=event.detail;log({event:'frame',release:frame.contentDocument.getElementById('fractal').dataset.release,...event.detail});});
+  for(const type of ['dragstart','dragend'])frame.contentDocument.addEventListener(type,event=>{
+    log({event:type,target:event.target.tagName,types:[...(event.dataTransfer?.types||[])],dropEffect:event.dataTransfer?.dropEffect,
+      x:event.screenX,y:event.screenY,canceled:event.defaultPrevented});
+  });
+  frame.contentDocument.addEventListener('fullscreenchange',async()=>{
+    const doc=frame.contentDocument,active=doc.fullscreenElement,previousFrame=lastFrame;
+    log({event:'fullscreenchange',element:active?.id||null});
+    if(!fullscreenTest)return;
+    try{
+      if(active)assert(active===doc.getElementById('fractal'),'An unstable image element became fullscreen');
+      await delay(250);await verify();
+      assert(doc.fullscreenElement===active,'Fullscreen changed during pixel verification');
+      assert(lastFrame!==previousFrame&&lastFrame?.phase==='final','Fullscreen transition did not calculate a fresh final frame');
+      if(active){
+        log('PASS: real image click entered Fullscreen API on the stable viewport; every fullscreen PNG pixel is correct.');
+        // Test-only automatic exit: no controls or keyboard interception in the app.
+        fullscreenTimer=setTimeout(()=>doc.exitFullscreen().catch(error=>log(`FAIL: ${error.message}`)),10000);
+      }else{
+        clearTimeout(fullscreenTimer);fullscreenTest=false;
+        log('PASS: fullscreen exit restored the embedded viewport and its exact full-resolution PNG.');
+      }
+    }catch(error){fullscreenTest=false;log(`FAIL: ${error.message}`);}
+  });
+});
+async function ready(){
+  for(let i=0;i<1000;++i){
+    const root=frame.contentDocument?.getElementById('fractal');
+    if(root?.dataset.state==='complete'&&root.dataset.resizeMode==='idle'&&root.dataset.phase==='final')return root;
+    await delay(20);
+  }
+  throw new Error('App did not complete within 20 seconds');
+}
+async function verify(root){
+  root ||= await ready();
+  const rect=root.getBoundingClientRect();
+  const width=Math.round(rect.width*frame.contentWindow.devicePixelRatio),height=Math.round(rect.height*frame.contentWindow.devicePixelRatio);
+  assert(frame.contentDocument.body.innerText.trim()==='','Visible app text found');
+  const image=await exported(root);
+  assert(image.naturalWidth===width&&image.naturalHeight===height,'PNG does not cover every physical viewport pixel');
+  assert(!root.querySelector('canvas'),'Settled export retained duplicate canvas backing stores');
+  const release=root.dataset.release;
+  if(!scalarModule || scalarRelease!==release){
+    const response=await caches.match(new URL(`releases/${release}/engine-scalar.wasm`,frame.src));
+    assert(response?.ok,'Reference WASM is missing from the offline cache');
+    scalarModule=await WebAssembly.compile(await response.arrayBuffer());
+    scalarRelease=release;
+  }
+  const e=new WebAssembly.Instance(scalarModule,{}).exports;e.configure(width,height);
+  const surfaces=new Map();
+  for(let y=0;y<height;y+=1024)for(let x=0;x<width;x+=1024){
+    const canvas=document.createElement('canvas');canvas.width=Math.min(1024,width-x);canvas.height=Math.min(1024,height-y);
+    const context=canvas.getContext('2d',{alpha:false});
+    context.drawImage(image,x,y,canvas.width,canvas.height,0,0,canvas.width,canvas.height);
+    surfaces.set(`${x},${y}`,{width:canvas.width,pixels:context.getImageData(0,0,canvas.width,canvas.height).data});
+  }
+  for(let y=0;y<height;y+=64)for(let x=0;x<width;x+=256){
+    const tw=Math.min(256,width-x),th=Math.min(64,height-y);e.render_tile(x,y,tw,th);
+    const expected=new Uint8Array(e.memory.buffer,e.output_address(),tw*th*4);
+    const sx=Math.floor(x/1024)*1024,sy=Math.floor(y/1024)*1024,surface=surfaces.get(`${sx},${sy}`);
+    for(let row=0;row<th;++row)for(let col=0;col<tw*4;++col){
+      const offset=((y-sy+row)*surface.width+x-sx)*4+col;
+      if(surface.pixels[offset]!==expected[row*tw*4+col])throw new Error(`Pixel mismatch at ${x},${y},${row},${col}`);
+    }
+  }
+  log(`PASS: ${width}x${height}, every decoded PNG RGBA byte matches scalar WASM, no visible text.`);
+}
+async function exported(root){
+  for(let i=0;i<2000;++i){
+    const image=root.querySelector('img.export-image');
+    if(root.dataset.exportState==='ready'&&image?.complete&&image.naturalWidth)return image;
+    await delay(10);
+  }
+  throw new Error('Full-image PNG did not become available');
+}
+document.getElementById('offline-icons').onclick=async()=>{
+  try{
+    const root=await ready(),release=root.dataset.release,base=new URL('./',frame.src);
+    const prefix=new URL(`releases/${release}/`,base).href;
+    const cache=await caches.open(`mandelbrot-${base.pathname}-${release}`);
+    const sameBytes=(a,b)=>a.length===b.length&&a.every((value,i)=>value===b[i]);
+    const get=async url=>{
+      const response=await frame.contentWindow.fetch(url,{cache:'no-store'});
+      assert(response.ok,`Missing icon resource: ${url}`);return response;
+    };
+    const manifestURL=new URL('site.webmanifest',base).href;
+    const response=await get(manifestURL);
+    assert(response.url===manifestURL,'Manifest response changed its base to an immutable release directory');
+    assert(response.headers.get('content-type')?.includes('application/manifest+json'),'Manifest MIME type is wrong');
+    const manifest=await response.json();
+    assert(new URL(manifest.start_url,manifestURL).href===base.href,'Manifest launch URL escaped the app root');
+    assert(new URL(manifest.scope,manifestURL).href===base.href,'Manifest scope escaped the app root');
+    assert(manifest.id===undefined,'Deployment-relative identity must fall back to stable start_url');
+    assert(manifest.icons.length===5,'Expected three transparent and two maskable PWA icons');
+    for(const icon of manifest.icons){
+      const url=new URL(icon.src,manifestURL).href;
+      assert(url.startsWith(prefix),'Manifest icon belongs to a different release');
+      assert(await cache.match(url),`PWA icon missing from offline cache: ${url}`);
+      const blob=await(await get(url)).blob(),objectURL=URL.createObjectURL(blob);
+      try{
+        const image=new Image();image.src=objectURL;await image.decode();
+        assert(`${image.naturalWidth}x${image.naturalHeight}`===icon.sizes,'Decoded PWA icon size differs from manifest');
+      }finally{URL.revokeObjectURL(objectURL);}
+    }
+    for(const link of frame.contentDocument.querySelectorAll('link[rel="icon"],link[rel="apple-touch-icon"]')){
+      assert(link.href.startsWith(prefix),'HTML icon belongs to a different release');
+      const stored=await cache.match(link.href);assert(stored,'HTML icon missing from offline cache');
+      assert(sameBytes(new Uint8Array(await(await get(link.href)).arrayBuffer()),new Uint8Array(await stored.arrayBuffer())),'HTML icon bypassed its offline release');
+    }
+    for(const name of ['site.webmanifest','favicon.ico','apple-touch-icon.png']){
+      const stored=await cache.match(new URL(name,prefix));assert(stored,`Missing alias target: ${name}`);
+      const response=await get(new URL(name,base));
+      assert(response.url===new URL(name,base).href,`Alias changed response URL: ${name}`);
+      assert(sameBytes(new Uint8Array(await response.arrayBuffer()),new Uint8Array(await stored.arrayBuffer())),`Alias differs from controlling release: ${name}`);
+    }
+    log(`PASS: offline favicon, Apple Touch, all five PWA icons and stable manifest/aliases resolve to release ${release}; subdirectory scope and decoded sizes are correct.`);
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+async function run(){
+  for(const [w,h]of[[320,180],[257,129],[120,320],[700,410]]){
+    frame.style.width=`${w}px`;frame.style.height=`${h}px`;await delay(100);await verify();
+  }
+  log('PASS: portrait, landscape, odd dimensions and multiple canvas surfaces.');
+}
+document.getElementById('run').onclick=()=>run().catch(error=>log(`FAIL: ${error.message}`));
+document.getElementById('reload').onclick=async()=>{
+  const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+  frame.contentWindow.location.reload();await loaded;await verify().catch(error=>log(`FAIL: ${error.message}`));
+};
+document.getElementById('resize').onclick=async()=>{
+  ++resizeCount;frame.style.width=`${resizeCount%2?333:700}px`;frame.style.height=`${resizeCount%2?277:410}px`;
+  await delay(100);await verify().catch(error=>log(`FAIL: ${error.message}`));
+};
+document.getElementById('update').onclick=async()=>{
+  const registration=await frame.contentWindow.navigator.serviceWorker.getRegistration();
+  await registration.update().catch(error=>log(`Update fetch: ${error.message}`));
+  log('Update check requested. A complete new release activates automatically.');
+};
+document.getElementById('benchmark').onclick=async()=>{
+  try{
+    await ready();const samples=new Map();
+    for(let repeat=0;repeat<3;++repeat)for(const [w,h]of[[1920,1080],[3840,2160],[7680,4320]]){
+      const completed=new Promise((resolve,reject)=>{
+        const timer=setTimeout(()=>reject(new Error('Benchmark timed out')),30000);
+        frame.contentDocument.addEventListener('mandelbrot-frame',function handler(event){
+          if(event.detail.width!==w||event.detail.height!==h)return;
+          clearTimeout(timer);frame.contentDocument.removeEventListener('mandelbrot-frame',handler);resolve(event.detail);
+        });
+      });
+      const dpr=frame.contentWindow.devicePixelRatio;
+      frame.style.width=`${w/dpr}px`;frame.style.height=`${h/dpr}px`;
+      const result=await completed,key=`${w}x${h}`;
+      if(!samples.has(key))samples.set(key,[]);samples.get(key).push(result.milliseconds);
+      await delay(30);
+    }
+    for(const [size,times]of samples){times.sort((a,b)=>a-b);log({benchmark:'parallel browser rendering',size,medianMilliseconds:times[1],samples:times});}
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+document.getElementById('core-benchmark').onclick=async()=>{
+  try{
+    const root=await ready(),release=root.dataset.release;
+    for(const variant of ['scalar','simd']){
+      const path=`/web/releases/${release}/engine-${variant}.wasm`;
+      const response=await fetch(path);if(!response.ok)continue;
+      const e=(await WebAssembly.instantiate(await response.arrayBuffer(),{})).instance.exports;
+      e.configure(640,360);for(let y=0;y<360;y+=64)for(let x=0;x<640;x+=256)e.render_tile(x,y,Math.min(256,640-x),Math.min(64,360-y));
+      for(const [w,h]of[[1920,1080],[3840,2160],[7680,4320]]){
+        e.configure(w,h);const samples=[];
+        for(let repeat=0;repeat<3;++repeat){
+          await delay(0);const started=performance.now();
+          for(let y=0;y<h;y+=64)for(let x=0;x<w;x+=256)e.render_tile(x,y,Math.min(256,w-x),Math.min(64,h-y));
+          samples.push(performance.now()-started);
+        }
+        samples.sort((a,b)=>a-b);log({benchmark:'one browser WASM instance',variant,width:w,height:h,medianMilliseconds:samples[1],samples});
+      }
+    }
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+document.getElementById('gate').onclick=async()=>{
+  let test;
+  try{
+    const fixture=await(await fetch('/internal/tests/fixtures.json')).json();
+    test=document.createElement('iframe');test.title='Incomplete installation test';test.src=fixture.missing;document.body.append(test);
+    await new Promise(resolve=>test.onload=resolve);await delay(1500);
+    const root=test.contentDocument.getElementById('fractal');
+    assert(root&&!root.dataset.release&&!root.querySelector('canvas'),'Incomplete package started rendering');
+    assert(test.contentDocument.body.innerText.trim()==='','Installation failure displayed text');
+    log('PASS: a missing WASM file leaves the first installation black, without importing the renderer or displaying text.');
+  }catch(error){log(`FAIL: ${error.message}`);}
+  finally{test?.remove();}
+};
+document.getElementById('fixture').onclick=async()=>{
+  try{
+    const fixture=await(await fetch('/internal/tests/fixtures.json')).json();
+    frame.style.width='320px';frame.style.height='180px';
+    frame.src=fixture.update;await delay(100);await ready();log(`Update fixture ready: ${fixture.update}`);
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+document.getElementById('retry-gate').onclick=async()=>{
+  let test;
+  try{
+    const fixture=await(await fetch('/internal/tests/fixtures.json')).json();
+    test=document.createElement('iframe');test.title='Restored installation test';test.src=fixture.missing;document.body.append(test);
+    await new Promise(resolve=>test.onload=resolve);
+    for(let i=0;i<1000;++i){if(test.contentDocument.getElementById('fractal')?.dataset.state==='complete')break;await delay(20);}
+    assert(test.contentDocument.getElementById('fractal')?.dataset.state==='complete','Restored installation did not recover');
+    log('PASS: the restored first installation completes automatically and renders the fractal.');
+  }catch(error){log(`FAIL: ${error.message}`);}
+  finally{test?.remove();}
+};
+document.getElementById('stress').onclick=async()=>{
+  try{
+    for(let i=0;i<20;++i){frame.style.width=`${701+i%3}px`;frame.style.height=`${411+i%5}px`;await delay(2);}
+    frame.style.width='511px';frame.style.height='333px';await delay(100);await verify();
+    log('PASS: rapid resize generations finish with exactly the latest viewport.');
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+document.getElementById('repair').onclick=async()=>{
+  try{
+    const scope=new URL(frame.src).pathname;
+    assert(scope.startsWith('/internal/tests/fixtures/'),'Open the isolated update fixture first');
+    const root=await ready(),release=root.dataset.release;
+    const cache=await caches.open(`mandelbrot-${scope}-${release}`);
+    const url=new URL(`releases/${release}/engine-simd.wasm`,frame.src).href;
+    assert(await cache.delete(url),'Test resource was not cached');
+    const loaded=new Promise(resolve=>frame.addEventListener('load',resolve,{once:true}));
+    frame.contentWindow.location.reload();await loaded;await ready();
+    assert(await cache.match(url),'Missing resource was not repaired');
+    log('PASS: startup detected a missing cached WASM file, repaired the same release and rendered only after completion.');
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+document.getElementById('slow-test').onclick=async()=>{
+  const RealWorker=window.Worker,host=document.getElementById('slow');let app;
+  try{
+    const root=await ready(),release=root.dataset.release;
+    const renderer=await import(`/web/releases/${release}/app.js`);
+    window.Worker=class{
+      constructor(...args){this.worker=new RealWorker(...args);}
+      set onmessage(fn){this.worker.onmessage=event=>event.data.type==='tile'?setTimeout(()=>fn(event),800):fn(event);}
+      set onerror(fn){this.worker.onerror=fn;}
+      set onmessageerror(fn){this.worker.onmessageerror=fn;}
+      postMessage(...args){this.worker.postMessage(...args);}
+      terminate(){this.worker.terminate();}
+    };
+    app=await renderer.start(host);
+    while(host.dataset.state!=='rendering')await delay(10);
+    await delay(100);assert(host.firstElementChild.style.visibility==='hidden','Slow frame appeared before threshold');
+    await delay(500);assert(host.firstElementChild.style.visibility==='visible','Slow frame was not revealed after threshold');
+    while(host.dataset.state!=='complete')await delay(20);
+    log('PASS: delayed worker results stay hidden initially, become visible after 500 ms and finish completely.');
+  }catch(error){log(`FAIL: ${error.message}`);}
+  finally{window.Worker=RealWorker;app?.dispose();host.replaceChildren();}
+};
+document.getElementById('adaptive-resize').onclick=async()=>{
+  const RealWorker=window.Worker,host=document.getElementById('slow');let app,slow=false;
+  const frames=[],modes=[],jobs=[];
+  const onFrame=event=>frames.push(event.detail),onMode=event=>modes.push(event.detail);
+  async function settled(){
+    for(let i=0;i<1000;++i){
+      if(host.dataset.state==='complete'&&host.dataset.phase==='final'&&host.dataset.resizeMode==='idle')return;
+      await delay(10);
+    }
+    throw new Error('Adaptive resize did not settle');
+  }
+  try{
+    const root=await ready(),release=root.dataset.release;
+    const renderer=await import(`/web/releases/${release}/app.js`);
+    host.replaceChildren();delete host.dataset.state;delete host.dataset.phase;host.dataset.release=release;
+    host.style.width='64px';host.style.height='48px';
+    host.addEventListener('mandelbrot-frame',onFrame);host.addEventListener('mandelbrot-resize',onMode);
+    window.Worker=class{
+      constructor(...args){this.worker=new RealWorker(...args);this.timers=new Set();}
+      set onmessage(fn){this.worker.onmessage=event=>{
+        if(event.data.type!=='tile'||!slow){fn(event);return;}
+        const timer=setTimeout(()=>{this.timers.delete(timer);fn(event);},80);this.timers.add(timer);
+      };}
+      set onerror(fn){this.worker.onerror=fn;}
+      set onmessageerror(fn){this.worker.onmessageerror=fn;}
+      postMessage(message,...args){
+        if(message.type==='render')jobs.push({generation:message.generation,phase:host.dataset.phase,bufferBytes:message.buffer?.byteLength});
+        this.worker.postMessage(message,...args);
+      }
+      terminate(){for(const timer of this.timers)clearTimeout(timer);this.worker.terminate();}
+    };
+    app=await renderer.start(host);await settled();
+    for(let i=0;i<8;++i){host.style.width=`${70+i}px`;host.style.height=`${50+i}px`;await delay(50);}
+    await settled();
+    const live=frames.filter(value=>value.phase==='live');
+    assert(live.length>=2,'Small resize did not produce continuous live frames');
+    assert(live.every(value=>value.milliseconds<33),'A late live frame was displayed');
+    log({test:'fast live resize',completedLiveFrames:live.length,maxMilliseconds:Math.max(...live.map(value=>value.milliseconds))});
+    const before=jobs.length,completeCount=frames.length;
+    slow=true;
+    for(let i=0;i<6;++i){
+      host.style.width=`${90+i}px`;host.style.height=`${70+i}px`;await delay(40);
+      if(i>=1)assert(host.dataset.resizeMode==='deferred','Slow gesture did not remain deferred');
+    }
+    const liveJobs=new Set(jobs.slice(before).filter(value=>value.phase==='live').map(value=>value.generation));
+    assert(liveJobs.size===1,'Slow gesture restarted live calculations');
+    assert(frames.length===completeCount,'Slow live frame was displayed');
+    assert(host.querySelector('.frame').style.visibility==='visible','Last complete image disappeared');
+    await settled();
+    const final=frames[frames.length-1],dpr=devicePixelRatio||1;
+    assert(final.phase==='final'&&final.width===95*dpr&&final.height===75*dpr,'Settled frame used an outdated size');
+    assert(jobs.slice(before).filter(value=>value.phase==='final').every(value=>value.bufferBytes===65536),'Canceled tile buffers were not recycled');
+    await verify(host);
+    assert(modes.some(value=>value.mode==='deferred'&&value.reason==='deadline'),'Deadline did not trigger the pause');
+    log('PASS: live updates below 32 ms; one slow attempt pauses the entire gesture; 150 ms idle produces the latest accurate final image.');
+  }catch(error){log(`FAIL: ${error.message}`);}
+  finally{
+    window.Worker=RealWorker;app?.dispose();host.replaceChildren();
+    host.style.width='320px';host.style.height='180px';
+    host.removeEventListener('mandelbrot-frame',onFrame);host.removeEventListener('mandelbrot-resize',onMode);
+  }
+};
+document.getElementById('image-export').onclick=async()=>{
+  try{
+    await ready();await verify();
+    const root=await ready(),image=await exported(root),url=image.src;
+    assert(image.draggable&&!image.hasAttribute('draggable'),'Image must keep the native auto drag state');
+    const response=await fetch(url),bytes=new Uint8Array(await response.arrayBuffer());
+    assert(response.headers.get('content-type')==='image/png','Image MIME type is not PNG');
+    assert(bytes.slice(0,8).join(',')==='137,80,78,71,13,10,26,10','PNG signature missing');
+    const header=new DataView(bytes.buffer);
+    assert(header.getUint32(16)===image.naturalWidth&&header.getUint32(20)===image.naturalHeight,'PNG header dimensions differ');
+    const contextMenu=new frame.contentWindow.MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2});
+    assert(image.dispatchEvent(contextMenu)&&!contextMenu.defaultPrevented,'Native context menu was canceled');
+    const transfer=new frame.contentWindow.DataTransfer();transfer.setData('text/uri-list',url);
+    const drag=new frame.contentWindow.DragEvent('dragstart',{bubbles:true,cancelable:true,dataTransfer:transfer});
+    assert(image.dispatchEvent(drag)&&!drag.defaultPrevented,'Native image drag was canceled');
+    assert(transfer.getData('text/uri-list')===url,'Native image URL was cleared');
+    assert(transfer.getData('DownloadURL')===`image/png:mandelbrot-${image.naturalWidth}x${image.naturalHeight}.png:${url}`,'Desktop download hint is incorrect');
+    frame.style.width='701px';frame.style.height='413px';await delay(200);await verify();
+    assert((await fetch(url)).ok,'Active drag URL was revoked during resize');
+    image.dispatchEvent(new frame.contentWindow.DragEvent('dragend',{dataTransfer:transfer}));
+    let released=false;try{await fetch(url);}catch{released=true;}
+    assert(released,'Retired PNG URL was not released after dragend');
+    log('PASS: full-image PNG, native context menu/drag defaults, PNG filename hint and drag URL lifetime.');
+
+    const release=root.dataset.release;
+    for(const compression of ['deflate','store'])for(const w of [137,513]){
+      const h=73;
+      const blob=await new Promise((resolve,reject)=>{
+        const worker=new Worker(`/web/releases/${release}/png-worker.js`,{type:'module'});
+        const timer=setTimeout(()=>{worker.terminate();reject(new Error('PNG worker timed out'));},10000);
+        worker.onerror=error=>{clearTimeout(timer);worker.terminate();reject(error);};
+        worker.onmessage=({data})=>{
+          if(data.type==='complete'){clearTimeout(timer);worker.terminate();resolve(data.blob);return;}
+          if(data.type==='error'){clearTimeout(timer);worker.terminate();reject(new Error(data.message));return;}
+          const pixels=new Uint8Array(w*data.height*4);
+          for(let y=0;y<data.height;++y)for(let x=0;x<w;++x){
+            const i=(y*w+x)*4;pixels[i]=x;pixels[i+1]=y+data.y;pixels[i+2]=(x*13+(y+data.y)*7)&255;pixels[i+3]=255;
+          }
+          worker.postMessage({type:'band',y:data.y,height:data.height,buffer:pixels.buffer},[pixels.buffer]);
+        };
+        worker.postMessage({type:'init',width:w,height:h,compression});
+      });
+      const bitmap=await createImageBitmap(blob),canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
+      const context=canvas.getContext('2d');context.drawImage(bitmap,0,0);bitmap.close();
+      const pixels=context.getImageData(0,0,w,h).data;
+      for(let y=0;y<h;++y)for(let x=0;x<w;++x){
+        const i=(y*w+x)*4;
+        assert(pixels[i]===(x&255)&&pixels[i+1]===y&&pixels[i+2]===((x*13+y*7)&255)&&pixels[i+3]===255,`${compression} PNG pixel mismatch`);
+      }
+      log(`PASS: ${compression} PNG strips at ${w}x${h}, odd dimensions and every independently generated RGBA byte.`);
+    }
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+document.getElementById('large-export').onclick=async()=>{
+  try{
+    const dpr=frame.contentWindow.devicePixelRatio;
+    for(const [w,h]of[[3840,2160],[7680,4320]]){
+      const started=performance.now();frame.style.width=`${w/dpr}px`;frame.style.height=`${h/dpr}px`;
+      await delay(200);await verify();
+      log({test:'complete large PNG and scalar pixel comparison',width:w,height:h,milliseconds:performance.now()-started});
+    }
+    log('PASS: complete 4K and 8K PNG images, every decoded RGBA byte, no full-image canvas allocation in the app.');
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+document.getElementById('fullscreen-test').onclick=async()=>{
+  try{
+    const root=await ready();await exported(root);
+    assert(frame.contentDocument.fullscreenEnabled&&root.requestFullscreen,'Fullscreen API is not allowed in this browser/frame');
+    fullscreenTest=true;
+    log('Fullscreen check armed: click the app image. The test verifies every PNG pixel, then exits automatically after 10 seconds.');
+  }catch(error){log(`FAIL: ${error.message}`);}
+};
+ready().then(()=>log('App ready. Run checks or stop the server and use reload/resize.')).catch(error=>log(`FAIL: ${error.message}`));
+</script>
+</html>
