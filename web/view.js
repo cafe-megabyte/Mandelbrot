@@ -22,11 +22,50 @@ export function fixedNumber(value, bits) {
   const shift = Math.max(0, value.toString(2).length-53);
   return sign * Number(value >> BigInt(shift)) * 2 ** (shift-bits);
 }
+// A binary fixed-point number has a terminating decimal expansion. Keep every
+// digit: converting the absolute coordinate to Number would lose deep pans.
+export function fixedDecimal(value, bits) {
+  value = BigInt(value);
+  if (!value) return '0';
+  const sign = value < 0n ? '-' : ''; value = value < 0n ? -value : value;
+  while (bits && !(value & 1n)) { value >>= 1n; --bits; }
+  if (!bits) return sign + value.toString();
+  const digits = (value * 5n ** BigInt(bits)).toString().padStart(bits+1, '0');
+  return sign + digits.slice(0, -bits) + '.' + digits.slice(-bits);
+}
+export function viewFragment(view) {
+  const x = fixedDecimal(view.real, view.bits), y = fixedDecimal(view.imag, view.bits);
+  if (!view.zoom && x === '-0.75' && y === '0') return '';
+  return `#x=${x}&y=${y}&zoom=${view.zoom}`;
+}
+export function viewFromFragment(fragment) {
+  try {
+    const fields = new Map();
+    for (const entry of fragment.replace(/^#/, '').split('&')) {
+      const [name, ...rest] = entry.split('=');
+      if (!['x','y','zoom'].includes(name)) continue;
+      if (fields.has(name)) return null;
+      fields.set(name, decodeURIComponent(rest.join('=')));
+    }
+    const real = fields.get('x'), imag = fields.get('y'), level = fields.get('zoom');
+    // Our links contain plain decimal coordinates, never rounded doubles or
+    // huge decimal exponents that could allocate unbounded powers of ten.
+    const decimal = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/;
+    if (!decimal.test(real || '') || !decimal.test(imag || '') || !level?.trim()) return null;
+    const zoom = Number(level);
+    if (!Number.isFinite(zoom) || zoom < 0 || 512+256*Math.ceil(zoom) > 0x7fffffbf) return null;
+    // An exact binary decimal with k fractional digits needs at most k bits.
+    // This also preserves guard bits retained after zooming back out.
+    const places = text => (text.split('.')[1] || '').length;
+    const bits = Math.ceil(Math.max(160,zoom+160,places(real),places(imag))/32)*32;
+    return {real, imag, zoom, bits};
+  } catch { return null; }
+}
 export function createView(saved) {
   let bits = 160, real = decimalFixed('-0.75',bits), imag = 0n, zoom = 0, revision = 0;
   if(saved){bits=saved.bits;real=BigInt(saved.real);imag=BigInt(saved.imag);zoom=saved.zoom;revision=saved.revision;}
-  function precision() {
-    const next = Math.ceil(Math.max(160,zoom+160)/32)*32;
+  function precision(minimum=160) {
+    const next = Math.ceil(Math.max(minimum,160,zoom+160)/32)*32;
     if (next>bits) { real <<= BigInt(next-bits); imag <<= BigInt(next-bits); bits=next; }
   }
   function scale(width,height) {
@@ -55,9 +94,10 @@ export function createView(saved) {
     if (!zoom) {real=decimalFixed('-0.75',bits);imag=0n;}
     ++revision;
   }
-  function set({real:r='-0.75',imag:i='0',zoom:z=0}) {
+  function set({real:r='-0.75',imag:i='0',zoom:z=0,bits:minimum=160}) {
     if(!Number.isFinite(z)||z<0)throw new Error('Invalid zoom');
-    zoom=z;precision();real=decimalFixed(r,bits);imag=decimalFixed(i,bits);++revision;
+    if(!Number.isSafeInteger(minimum)||minimum<0||minimum>0x7fffffbf)throw new Error('Invalid precision');
+    zoom=z;precision(minimum);real=decimalFixed(r,bits);imag=decimalFixed(i,bits);++revision;
   }
   function reset(){set({});}
   return {snapshot,change,set,reset};

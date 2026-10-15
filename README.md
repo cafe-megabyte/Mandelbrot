@@ -20,7 +20,8 @@ The settled image also becomes a full-resolution PNG with the browser's native
 image context menu. Right-click to copy or save the current region. Dragging
 inside the app moves the region. Zooming all the way out restores the initial
 figure; `R` or `Home` also resets it. Browser reload shortcuts retain their usual
-behavior.
+behavior. The URL records the selected centre and zoom after each gesture;
+copy it to reopen or share the same view, including after a reload.
 Click the picture to enter fullscreen; use the browser's Escape action to leave.
 
 ![Mandelbrot running in the browser](docs/preview.jpg)
@@ -259,7 +260,32 @@ in JavaScript; Mandelbrot iteration and colouring remain in C/WASM. The scale is
 stored as a mantissa and a separate exponent, avoiding ordinary double's
 underflow at magnifications such as `2^1600`. Returning to the full view resets
 the centre. Resizing, rotation, fullscreen and automatic renderer updates retain
-the chosen view; a document reload starts at the initial view.
+the chosen view. A document reload restores the view encoded in the URL.
+
+The fragment uses actual complex-plane coordinates, for example
+`#x=-0.75&y=0.1&zoom=7`. Here `x` is the real coordinate, `y` the imaginary
+coordinate (positive upwards), and `zoom` is the base-two exponent of the
+magnification relative to the initial fitted view: `7` means `128×`. Fractional
+zoom levels are supported. Viewport shape and device resolution still determine
+the visible edges and sample spacing; a link preserves the centre and relative
+magnification rather than an exact pixel rectangle on every screen.
+
+Coordinates are decimal digit strings generated directly from the binary
+fixed-point integers. Every digit of their terminating decimal expansion is
+retained, without conversion through `Number`, and parsing restores enough bits
+to preserve the coordinates exactly. This also retains extra guard bits after
+zooming back out. Such links can become long at extreme depths; the fragment
+is never sent to the server and works with offline navigation and subdirectory
+deployments. There is no additional URL-specific rounding or fixed zoom cap.
+The existing iteration, memory and browser URL-length limits still apply.
+
+Each completed wheel, pinch or drag gesture replaces the current history entry;
+it does not add entries for every movement. Opening a different fragment and
+browser Back/Forward restore that view. Invalid or incomplete fragments use
+the initial view. Reset removes the fragment. No local/session storage is used;
+the installed web app's manifest still launches the initial view, and a killed
+app need not remember its last position. Renderer updates retain the in-memory
+view as before.
 
 During a gesture, CSS transforms the previous complete image. Computation and
 PNG preparation are deferred until pointer release, or 150 ms after the last
@@ -312,6 +338,68 @@ need more iterations than the automatic budget supplies, and expensive fallback
 pixels can dominate rendering time. There is no promise of constant rendering
 time at arbitrary depth. Allocation and 32-bit WASM address-space limits remain
 real resource limits and are reported rather than silently reducing resolution.
+
+### Acceleration audit (15 October 2026)
+
+Comparison with [Wikipedia's practical calculation section](https://de.wikipedia.org/wiki/Mandelbrot-Menge#Praktische_Berechnung),
+including its deep-zoom subsection, and the implementation's
+[primary deep-zoom reference](https://mathr.co.uk/web/deep-zoom.html):
+
+| Technique | Current implementation / decision |
+| --- | --- |
+| Escape test and zoom-dependent iteration budget | Present; squared magnitude avoids a square root in the ordinary escape test. |
+| Convergence / periodicity | Exact floating-point repetition in scalar/SIMD; exact reference-cycle reuse only without accumulated rounding error. No epsilon-based early interior guess. |
+| Known interior regions | Conservative main-cardioid and period-2 tests; exact real-axis interval in the fixed-point fallback. |
+| Divide-and-conquer / filling uniform rectangles | Absent. Equal sampled boundary colours do not certify all interior pixel colours, especially with smooth colouring. |
+| Time interpolation | Smooth escape colouring is present. Changing the escape radius or omitting `c` after escape would alter the existing colours. |
+| Distance estimation | Absent; not needed for the current escape-time palette. Adding it as a replacement colouring method would change the image. |
+| Arbitrary precision | Present, adaptive limb arithmetic and double-double intermediate fallback. |
+| Perturbation and rebasing | Present; rebase to reference iteration zero when the deviation exceeds the actual orbit or the reference ends. |
+| Series approximation and BLA | Present, with propagated error bounds and precise fallback; not a blind omission of nonlinear terms. |
+| GPU parallelism | Absent. CPU SIMD and up to eight workers are present; the deep loop itself is scalar. A GPU backend would require a separate accuracy and compatibility project. |
+
+The small optimization in this change reuses the previous iteration's already
+computed norm in double-double/fixed-point fallbacks, hoists the constant
+parameter norm out of the perturbation loop, and avoids a reference norm on BLA
+steps that do not use it. Operation order, error bounds, bailout, iteration budget
+and palette stay the same. Old/new scalar and SIMD WASM output is compared
+byte for byte on the measured tiles; this checks the new optimization separately
+from the existing independent-orbit tests.
+
+The [before/after measurements](docs/deep-optimization-benchmark.json) contain
+five warmed samples in JavaScriptCore per variant and view, with alternating
+execution order. These are 33 × 17 tiles with at most 4096 iterations, excluding
+shared reference setup, worker transfers, display and PNG export. All 5610
+compared pixel values were identical. The seahorse fixture improved by about
+2%; the other measured changes were small (including one slightly slower
+case), so this is not a general rendering-speed breakthrough. The optional
+[comparison script](tests/deep-optimization-benchmark.js) explains how to capture
+old WASM snapshots and repeat the measurement.
+
+The largest remaining opportunities are:
+
+1. Use additional local high-precision references for tiles/pixels that currently
+   fall back to full limb iteration. Keep the error checks and retry uncertain
+   pixels; reference selection and cost need measurement on difficult regions.
+2. Optimize exact limb multiplication/squaring and zero limbs, retaining every
+   carry and the current truncation/rounding detection. These operations dominate
+   expensive fallback orbits and currently use quadratic schoolbook multiplication.
+3. Vectorize the deep perturbation/double-double paths and improve work balancing
+   for unusually slow tiles. Arithmetic order and final pixel comparisons must
+   be checked; existing SIMD accelerates only the ordinary double path.
+
+The previous full-frame measurements below already show the bottleneck:
+around `c=i` at `2^400`, reference preparation took only 13–14 ms, while hundreds
+of thousands of precise fallback pixels stretched 4K/8K frames to seconds.
+Simply speeding up reference preparation cannot fix those cases. BLA bounds or
+fallback thresholds should not be loosened just to reduce those counts.
+
+Accuracy here retains the existing renderer's definition: finite iteration
+budget, bounded numerical approximations and the current smooth palette.
+The existing deep tests allow up to one RGB channel step against independent
+high-precision orbits; they are not a proof of identical colours for every
+possible coordinate. The new caching optimization must additionally preserve
+the old renderer's bytes on its regression fixtures.
 
 ### Fullscreen, save or copy the image
 

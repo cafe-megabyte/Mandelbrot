@@ -31,6 +31,13 @@ async function verifyShallow(){
 }
 document.getElementById('check').onclick=async()=>{try{
   await completed(()=>app.setView({real:'-0.75',imag:'0.1',zoom:7}));await verifyShallow();
+  assert(location.hash.startsWith('#x=-0.75&y=0.'),'Coordinates missing from URL');
+  assert(location.hash.endsWith('&zoom=7'),'Zoom missing from URL');
+  const linked=app.getView(),historyLength=history.length;
+  app.dispose();delete host._mandelbrotView;
+  const reloaded=completed();app=await renderer.start(host);await reloaded;
+  assert(app.getView().real===linked.real && app.getView().imag===linked.imag && app.getView().zoom===linked.zoom,'URL startup lost the view');
+  await verifyShallow();
   const first=app.getView();
   const rectangle=host.getBoundingClientRect();
   await completed(()=>host.dispatchEvent(new WheelEvent('wheel',{clientX:rectangle.left+230,clientY:rectangle.top+140,deltaY:-80,cancelable:true,bubbles:true})));
@@ -44,6 +51,17 @@ document.getElementById('check').onclick=async()=>{try{
     host.dispatchEvent(new PointerEvent('pointerup',{pointerId:92,pointerType:'touch',bubbles:true}));
   });
   assert(Math.abs(app.getView().zoom-before.zoom-1)<1e-10,'Pinch scale incorrect');await verifyShallow();
+  assert(history.length===historyLength,'Gestures cluttered browser history');
+  const gestureLink=location.hash;
+  await completed(()=>{location.hash='#x=-0.75&y=0.1&zoom=7';});
+  assert(app.getView().zoom===7,'Hash navigation did not restore view');
+  await completed(()=>history.back());
+  assert(location.hash===gestureLink && app.getView().zoom===before.zoom+1,'Back navigation did not restore view');
+  await completed(()=>history.forward());
+  assert(app.getView().zoom===7,'Forward navigation did not restore view');
+  await completed(()=>app.reset());
+  assert(location.hash==='' && app.getView().zoom===0,'Reset did not clear view URL');
+  log('PASS: URL startup, wheel/pinch URL updates, reset, back/forward and stable history length.');
   const deep=await completed(()=>app.setView({real:'0',imag:'1',zoom:400}));
   assert(deep.deep && deep.skippedIterations>0,'Deep acceleration failed');log({check:'deep zoom',...deep});
   await exported();const at=app.getView();

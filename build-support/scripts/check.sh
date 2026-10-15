@@ -9,6 +9,7 @@ INTERNAL="$PWD/build/internal"
 "$INTERNAL/tests/deep-check"
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/wasm-compare.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/deep-wasm-check.js
+"$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/view-url-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/resize-scheduler-check.js
 for SOURCE in web/app.js web/resize-scheduler.js web/image-export.js web/png-worker.js web/engine-worker.js web/view.js web/navigation.js web/reference-worker.js web/service-worker.js; do
     sed '/^import /d;s/^export //' "$SOURCE" > "$INTERNAL/tmp/js-syntax.js"

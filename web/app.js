@@ -1,14 +1,16 @@
 import {createResizeScheduler} from './resize-scheduler.js';
 import {createImageExport} from './image-export.js';
-import {createView, previewTransform} from './view.js';
+import {createView, previewTransform, viewFragment, viewFromFragment} from './view.js';
 import {createNavigation} from './navigation.js';
 
 const TILE_WIDTH = 256, TILE_HEIGHT = 64, SURFACE_SIZE = 1024;
 
 export async function start(root) {
   let disposed = false, pending, frameRequest = 0;
-  let physicalSize, replacementCount = 0, fullscreenPending = false, referenceWorker;
+  let physicalSize, replacementCount = 0, fullscreenPending = false, referenceWorker, viewURL = location.hash;
   const view = createView(root._mandelbrotView);
+  const linkedView = viewFromFragment(location.hash);
+  if (!root._mandelbrotView && linkedView) view.set(linkedView);
   const slots = [];
   const simdBytes = await loadBytes('engine-simd.wasm');
   const backend = WebAssembly.validate(simdBytes) ? 'simd128' : 'scalar';
@@ -30,7 +32,26 @@ export async function start(root) {
       root.dispatchEvent(new CustomEvent('mandelbrot-resize', {bubbles: true, detail}));
     }
   });
-  const navigation = createNavigation(root, view, active => { scheduler.hold(active); resize(); });
+  const navigation = createNavigation(root, view, active => {
+    if (active) { scheduler.hold(true); resize(); }
+    else { saveURL(); selectView(); }
+  });
+  function selectView() {
+    scheduler.hold(true); resize();
+    requestAnimationFrame(() => scheduler.hold(false));
+  }
+  function saveURL() {
+    const fragment = viewFragment(currentView());
+    if (fragment !== location.hash)
+      history.replaceState(history.state, '', location.pathname + location.search + fragment);
+    viewURL = fragment;
+  }
+  function restoreURL() {
+    if (viewURL === location.hash) return;
+    viewURL = location.hash;
+    view.set(viewFromFragment(location.hash) || {});
+    selectView();
+  }
 
   function newSlot() {
     return new Promise((resolve, reject) => {
@@ -272,6 +293,7 @@ export async function start(root) {
     if (pending && !pending.shown) pending.layer.remove();
     densityQuery?.removeEventListener('change', densityChanged);
     window.removeEventListener('resize', resize); document.removeEventListener('visibilitychange', resume);
+    window.removeEventListener('hashchange', restoreURL); window.removeEventListener('popstate', restoreURL);
     root.removeEventListener('click', enterFullscreen); document.removeEventListener('fullscreenchange', fullscreenChanged);
     for (const slot of slots) { clearTimeout(slot.timer); slot.worker.terminate(); }
   }
@@ -281,10 +303,11 @@ export async function start(root) {
   try { observer.observe(root, {box: 'device-pixel-content-box'}); }
   catch { observer.observe(root); }
   window.addEventListener('resize', resize); document.addEventListener('visibilitychange', resume);
+  window.addEventListener('hashchange', restoreURL); window.addEventListener('popstate', restoreURL);
   root.addEventListener('click', enterFullscreen); document.addEventListener('fullscreenchange', fullscreenChanged);
   densityChanged();
-  return {dispose, backend, setView: target => { view.set(target); scheduler.hold(true); resize();
-    requestAnimationFrame(() => scheduler.hold(false)); }, getView: currentView, reset: () => { view.reset(); resize(); }};
+  return {dispose, backend, setView: target => { view.set(target); saveURL(); selectView(); }, getView: currentView,
+    reset: () => { view.reset(); saveURL(); selectView(); }};
 }
 
 async function loadBytes(name) {

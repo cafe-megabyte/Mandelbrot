@@ -284,14 +284,13 @@ static DoubleDouble big_dd(const uint32_t *a,int sign){
 static uint32_t dd_pixel(Extended dc,int *certain){
     DoubleDouble cr=dd_add(dd_real,(DoubleDouble){dc.r*power_two(dc.e),0});
     DoubleDouble ci=dd_add(dd_imag,(DoubleDouble){dc.i*power_two(dc.e),0});
-    DoubleDouble x={0},y={0};double error=0;
+    DoubleDouble x={0},y={0};double error=0,norm=0;
     for(unsigned n=1;n<=limit;++n){
         DoubleDouble xx=dd_multiply(x,x),yy=dd_multiply(y,y),xy=dd_multiply(x,y);
-        double magnitude_bound=__builtin_sqrt(x.hi*x.hi+y.hi*y.hi);
-        error=(2*magnitude_bound+error)*error+0x1p-96*(xx.hi+yy.hi+absd(cr.hi)+absd(ci.hi));
+        error=(2*norm+error)*error+0x1p-96*(xx.hi+yy.hi+absd(cr.hi)+absd(ci.hi));
         x=dd_add(dd_add(xx,dd_negative(yy)),cr);y=dd_add(dd_add(xy,xy),ci);
         DoubleDouble mag=dd_add(dd_multiply(x,x),dd_multiply(y,y));
-        double norm=__builtin_sqrt(x.hi*x.hi+y.hi*y.hi);
+        norm=__builtin_sqrt(x.hi*x.hi+y.hi*y.hi);
         if(error>0x1p-32*(norm+0x1p-100)){*certain=0;return 0;}
         DoubleDouble margin=dd_add(mag,(DoubleDouble){-4,0});
         if(absd(margin.hi)+absd(margin.lo)<=error*(2*norm+error) && (margin.hi||margin.lo||error)){
@@ -352,14 +351,14 @@ static uint32_t fixed_pixel(Extended dc) {
         if(compare_big(scratch[6],scratch[4])<=0)return UINT32_C(0xff000000);
     }
     clear_big(xr_big);clear_big(xi_big);xr_sign=xi_sign=1;
-    Extended error={0},previous={0};
+    Extended error={0},previous_norm={0};
     for(unsigned n=1;n<=limit;++n){
         rounded_product=0;orbit_step(scratch[6],sr,scratch[7],si);
         Extended z=current_big(),norm=norm_ext(z);
-        error=mul_ext(add_ext(scale_ext(norm_ext(previous),2),error),error);
+        error=mul_ext(add_ext(scale_ext(previous_norm,2),error),error);
         if(rounded_product)error=add_ext(error,ext(4,0,-32*(int)fraction));
         if(error.r && !less_ext(error,mul_ext(norm,ext(1,0,-48)))){precision_needed=1;return 0;}
-        previous=z;double mag=escape_magnitude(z);
+        previous_norm=norm;double mag=escape_magnitude(z);
         if(absd(mag-4)<1e-10){
             rounded_product=0;Extended margin=precise_margin();
             Extended uncertainty=mul_ext(error,add_ext(scale_ext(norm,2),error));
@@ -383,8 +382,9 @@ static uint32_t perturb_pixel(Extended dc) {
         delta=mul_ext(delta,t);error=series_error;n=m=series_start;deep_skipped+=series_start;
     }
     const Extended rounding=ext(1,0,-48),tolerance=ext(1,0,-30);
+    const Extended cnorm=norm_ext(dc);
     while(n<limit){
-        Extended dnorm=norm_ext(delta),cnorm=norm_ext(dc),zref=norm_ext(orbit[m]);
+        Extended dnorm=norm_ext(delta);
         const Approximation *chosen=NULL;
         if(!(m%16))for(unsigned l=0;l<deep_header->levels;++l){
             unsigned block=16u<<l;if(m%block)break;
@@ -401,6 +401,7 @@ static uint32_t perturb_pixel(Extended dc) {
             error=add_ext(add_ext(mul_ext(amplification,error),remainder),round);
             delta=add_ext(ad,bc);n+=chosen->steps;m+=chosen->steps;deep_skipped+=chosen->steps-1;
         }else{
+            Extended zref=norm_ext(orbit[m]);
             Extended a=mul_ext(scale_ext(orbit[m],2),delta),b=mul_ext(delta,delta);
             Extended amplification=add_ext(scale_ext(add_ext(zref,dnorm),2),error);
             error=add_ext(mul_ext(amplification,error),mul_ext(rounding,add_ext(add_ext(norm_ext(a),norm_ext(b)),cnorm)));
