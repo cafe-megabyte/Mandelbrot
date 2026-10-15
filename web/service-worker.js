@@ -5,12 +5,12 @@ const CACHE = `${PREFIX}${RELEASE}`;
 const INVENTORY = new URL(`releases/${RELEASE}/offline-resources.json`, BASE).href;
 const COMPLETE = new URL(`.offline-complete-${RELEASE}`, BASE).href;
 const INDEX = new URL(`releases/${RELEASE}/index.html`, BASE).href;
-const REQUIRED = ['index.html', 'app.js', 'resize-scheduler.js', 'image-export.js', 'png-worker.js', 'engine-worker.js', 'view.js', 'navigation.js', 'reference-worker.js', 'engine-scalar.wasm', 'engine-simd.wasm', 'XCC-LICENSE.txt',
+const REQUIRED = ['index.html', 'app.js', 'resize-scheduler.js', 'tile-queue.js', 'image-export.js', 'png-worker.js', 'engine-worker.js', 'view.js', 'navigation.js', 'reference-worker.js', 'engine-scalar.wasm', 'engine-simd.wasm', 'XCC-LICENSE.txt',
   'site.webmanifest', 'favicon.ico', 'favicon-16.png', 'favicon-32.png', 'favicon-48.png',
   'apple-touch-icon-152.png', 'apple-touch-icon-167.png', 'apple-touch-icon.png',
   'icon-192.png', 'icon-512.png', 'icon-1024.png', 'icon-maskable-512.png', 'icon-maskable-1024.png'];
 const ALIASES = ['site.webmanifest', 'favicon.ico', 'apple-touch-icon.png'];
-let repairPromise;
+let repairPromise, verificationPromise;
 
 function validateInventory(inventory) {
   if (inventory?.release !== RELEASE || !Array.isArray(inventory.resources)) throw new Error('Mixed offline release');
@@ -26,10 +26,19 @@ function validateInventory(inventory) {
   return inventory;
 }
 
-async function complete() {
-  const cache = await caches.open(CACHE);
-  if (!await cache.match(COMPLETE)) return false;
+function complete() {
+  // Activation and multiple clients can ask together. Share only an in-flight
+  // scan: a later startup must still detect resources evicted from the cache.
+  if (!verificationPromise) {
+    const pending = verify().finally(() => { if (verificationPromise === pending) verificationPromise = null; });
+    verificationPromise = pending;
+  }
+  return verificationPromise;
+}
+async function verify() {
   try {
+    const cache = await caches.open(CACHE);
+    if (!await cache.match(COMPLETE)) return false;
     const response = await cache.match(INVENTORY);
     if (!response) return false;
     const inventory = validateInventory(await response.json());
@@ -77,11 +86,19 @@ self.addEventListener('activate', event => event.waitUntil((async () => {
 self.addEventListener('message', event => {
   if (!['status', 'repair'].includes(event.data?.type) || !event.ports[0]) return;
   event.waitUntil((async () => {
-    let ready = await complete();
+    let ready = false;
+    try { ready = repairPromise ? await repairPromise : await complete(); }
+    catch (error) { console.debug('Mandelbrot offline verification:', error.message); }
     if (!ready && event.data.type === 'repair') {
       try {
-        if (!repairPromise) repairPromise = download().finally(() => { repairPromise = null; });
-        await repairPromise; ready = await complete();
+        if (!repairPromise) repairPromise = (async () => {
+          await download();
+          // A status scan begun before the download may have observed missing
+          // entries. The repaired package always gets a fresh shared scan.
+          verificationPromise = null;
+          return complete();
+        })().finally(() => { repairPromise = null; });
+        ready = await repairPromise;
       } catch (error) { console.debug('Mandelbrot offline repair:', error.message); }
     }
     event.ports[0].postMessage({ready, release: RELEASE});

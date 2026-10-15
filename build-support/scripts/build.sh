@@ -185,7 +185,7 @@ build_web() {
         "$CC" --target=wasm32-unknown-unknown -ffreestanding -fno-builtin -O3 \
             -ffp-contract=off -fno-math-errno -std=c11 "$@" \
             -S web/native/wasm-adapter.c -o "$INTERNAL/wasm/engine-$VARIANT.s"
-        EXPORTS='abi_version configure configure_view iteration_limit pixel_step render_tile output_address tile_width tile_height deep_allocate deep_input_address deep_digits deep_data_address deep_data_size deep_begin deep_reference deep_finish deep_configure deep_render_tile deep_stat_skipped deep_stat_fallbacks deep_needs_precision'
+        EXPORTS='abi_version configure configure_view iteration_limit pixel_step render_tile output_address tile_width tile_height deep_allocate deep_input_address deep_digits deep_data_address deep_data_size deep_begin deep_reference deep_finish deep_configure deep_render_tile deep_stat_skipped deep_stat_fallbacks deep_needs_precision deep_default_options deep_set_options deep_reset_stats deep_grow_precision deep_render_tile_resume deep_tile_completed_pixels deep_stat_dd_fallbacks deep_stat_dd_iterations deep_stat_fixed_iterations deep_stat_reference_iterations deep_stat_local_references deep_stat_perturb_iterations deep_stat_certified_pixels deep_stat_certificate_iterations'
         set --
         for NAME in $EXPORTS; do set -- "$@" -e "$NAME"; done
         "$LINKER" -nostdlib --entry-point= --stack-size=65536 "$@" \
@@ -196,7 +196,7 @@ build_web() {
     STAGE="$INTERNAL/web/staging"
     rm -rf "$STAGE"; mkdir -p "$STAGE/releases/$RELEASE"
     if [ -d build/web/releases ]; then cp -R build/web/releases/. "$STAGE/releases/"; fi
-    cp web/app.js web/resize-scheduler.js web/image-export.js web/png-worker.js web/engine-worker.js web/view.js web/navigation.js web/reference-worker.js "$STAGE/releases/$RELEASE/"
+    cp web/app.js web/resize-scheduler.js web/image-export.js web/png-worker.js web/engine-worker.js web/view.js web/navigation.js web/reference-worker.js web/tile-queue.js "$STAGE/releases/$RELEASE/"
     cp "$INTERNAL/wasm/"*.wasm "$STAGE/releases/$RELEASE/"
     cp "$INTERNAL/toolchain/xcc/source/LICENSE" "$STAGE/releases/$RELEASE/XCC-LICENSE.txt"
     printf '%s\n' "$RELEASE" > "$STAGE/release.txt"

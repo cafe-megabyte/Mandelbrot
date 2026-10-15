@@ -10,7 +10,7 @@ iframe{display:block;border:0;background:#000;width:320px;height:180px}pre{white
 <h1>Mandelbrot browser checks</h1>
 <p>This developer-only page is excluded from the offline website.</p>
 <button id="run">Run pixel and resize checks</button>
-<button id="slow-test">Test adaptive presentation</button>
+<button id="slow-test">Test symmetry and real progress</button>
 <button id="adaptive-resize">Test adaptive live resize</button>
 <button id="image-export">Test full-image PNG and context menu</button>
 <button id="offline-icons">Test offline icons and manifest</button>
@@ -160,7 +160,7 @@ document.getElementById('offline-icons').onclick=async()=>{
   }catch(error){log(`FAIL: ${error.message}`);}
 };
 async function run(){
-  for(const [w,h]of[[320,180],[257,129],[120,320],[700,410]]){
+  for(const [w,h]of[[320,180],[257,129],[120,320],[700,410],[9,1026]]){
     frame.style.width=`${w}px`;frame.style.height=`${h}px`;await delay(100);await verify();
   }
   log('PASS: portrait, landscape, odd dimensions and multiple canvas surfaces.');
@@ -281,26 +281,98 @@ document.getElementById('repair').onclick=async()=>{
   }catch(error){log(`FAIL: ${error.message}`);}
 };
 document.getElementById('slow-test').onclick=async()=>{
-  const RealWorker=window.Worker,host=document.getElementById('slow');let app;
+  const RealWorker=window.Worker,host=document.getElementById('slow');let app,held=true,last;
+  const queued=[],oldStyle=host.getAttribute('style'),oldURL=location.href,oldView=host._mandelbrotView;
+  const onFrame=event=>{last=event.detail;};host.addEventListener('mandelbrot-frame',onFrame);
+  const until=async predicate=>{for(let j=0;j<1000;++j){if(predicate())return;await delay(10);}throw new Error('Progress test timed out');};
+  const bar=()=>host.querySelector('.render-progress');
   try{
     const root=await ready(),release=root.dataset.release;
     const renderer=await import(`/web/releases/${release}/app.js`);
+    history.replaceState(history.state,'',location.pathname+location.search);
+    host.dataset.release=release;
+    host.replaceChildren();delete host.dataset.state;delete host._mandelbrotView;
+    host.style.width=`${513/devicePixelRatio}px`;host.style.height=`${129/devicePixelRatio}px`;
     window.Worker=class{
       constructor(...args){this.worker=new RealWorker(...args);}
-      set onmessage(fn){this.worker.onmessage=event=>event.data.type==='tile'?setTimeout(()=>fn(event),800):fn(event);}
+      set onmessage(fn){this.worker.onmessage=event=>{
+        if(held&&['tile','reference'].includes(event.data.type))queued.push({deliver:()=>fn(event),job:this.job,data:event.data});
+        else fn(event);
+      };}
       set onerror(fn){this.worker.onerror=fn;}
       set onmessageerror(fn){this.worker.onmessageerror=fn;}
-      postMessage(...args){this.worker.postMessage(...args);}
+      postMessage(message,...args){if(message.type==='render')this.job=message;this.worker.postMessage(message,...args);}
       terminate(){this.worker.terminate();}
     };
     app=await renderer.start(host);
-    while(host.dataset.state!=='rendering')await delay(10);
-    await delay(100);assert(host.firstElementChild.style.visibility==='hidden','Slow frame appeared before threshold');
-    await delay(500);assert(host.firstElementChild.style.visibility==='visible','Slow frame was not revealed after threshold');
-    while(host.dataset.state!=='complete')await delay(20);
-    log('PASS: delayed worker results stay hidden initially, become visible after 500 ms and finish completely.');
+    await until(()=>host.dataset.state==='rendering');
+    await delay(100);
+    assert(host.querySelector('.frame').style.visibility==='hidden'&&!bar(),'Slow frame or progress appeared before threshold');
+    await until(bar);
+    const pill=host.querySelector('.render-progress-pill'), count=host.querySelector('.render-progress-count');
+    const countWidth=count.getBoundingClientRect().width,pillWidth=pill.getBoundingClientRect().width;
+    assert(pill.contains(bar())&&pill.querySelector('.render-progress-label').getBoundingClientRect().bottom<bar().getBoundingClientRect().top,
+      'Progress label and bar are not together in the pill');
+    assert(getComputedStyle(pill).fontVariantNumeric.includes('tabular-nums'), 'Progress figures are not tabular');
+    const thousands=pill.lang==='de'?'.':',';
+    assert(count.textContent==='0'&&host.querySelector('.render-progress-total').textContent===`66${thousands}177`,
+      'Progress label does not show the physical pixel total');
+    assert(host.querySelector('.frame').style.visibility==='visible','Slow initial frame was not revealed');
+    assert(bar().getAttribute('aria-valuenow')==='0','Progress advanced without completed pixels');
+    await delay(100);
+    assert(bar().getAttribute('aria-valuenow')==='0','Progress advanced with time alone');
+    assert(getComputedStyle(bar()).pointerEvents==='none'&&bar().getBoundingClientRect().height===6,'Progress overlay blocks navigation or is invisible');
+    let pixels=0,partial=false;
+    while(host.dataset.state!=='complete'){
+      await until(()=>queued.length);
+      const entry=queued.shift(),job=entry.job;
+      pixels+=job.width*job.height*(job.mirrorY===null?1:2);entry.deliver();
+      if(host.dataset.state!=='complete'){
+        partial=true;assert(Number(bar().getAttribute('aria-valuenow'))===Math.floor(100*pixels/(513*129)),
+          'Progress does not match completed pixels, including mirrored/partial edge tiles');
+        assert(count.textContent===String(pixels).replace(/\B(?=(\d{3})+(?!\d))/g,thousands)&&host.querySelector('.render-progress-percent').textContent===String(Math.floor(100*pixels/(513*129))),
+          'Progress text does not match completed mirrored/edge pixels');
+        const bullet=host.querySelector('.render-progress-separator'),unit=bullet.previousElementSibling,percentage=bullet.nextElementSibling;
+        const leftGap=bullet.getBoundingClientRect().left-unit.getBoundingClientRect().right;
+        const rightGap=percentage.getBoundingClientRect().left-bullet.getBoundingClientRect().right;
+        assert(bullet.textContent==='•'&&Math.abs(leftGap-rightGap)<0.01,'Progress bullet is not centred between pixels and percentage');
+        assert(Math.abs(count.getBoundingClientRect().width-countWidth)<0.01&&Math.abs(pill.getBoundingClientRect().width-pillWidth)<0.01,
+          'Progress text changes width as the number of digits increases');
+      }
+    }
+    assert(partial&&pixels===513*129&&!bar(),'Progress coverage or completion cleanup failed');
+    assert(last.computedPixels===513*65&&last.mirroredPixels===513*64,'Odd centred frame did not halve calculation');
+    log('PASS: 500 ms delay, zero progress without results, exact pixel-weighted progress with symmetry and edge tiles; bar disappears on completion.');
+
+    held=false;last=null;app.reset();await until(()=>last);
+    assert(last.milliseconds<500&&!bar(),'Fast navigation displayed a progress bar');
+    log('PASS: fast navigation completes without a progress bar.');
+
+    const current=app.getView(),spacing=current.mantissa*2**current.exponent;
+    for(const direction of [-1,1]){
+      last=null;app.setView({real:'-0.75',imag:(direction*spacing*8).toFixed(80),zoom:0});
+      await until(()=>last);await verify(host);
+      assert(last.mirroredPixels>0&&last.computedPixels+last.mirroredPixels===513*129,'Panned symmetry lost pixel coverage');
+    }
+    log('PASS: both larger-side directions produce full-resolution PNG pixels identical to full scalar computation.');
+
+    held=true;last=null;app.setView({real:'-0.75',imag:'0.1',zoom:2});await until(bar);
+    const stale=queued.splice(0);app.reset();assert(!bar(),'Cancellation retained the old progress bar');
+    await until(bar);for(const entry of stale)entry.deliver();
+    assert(bar().getAttribute('aria-valuenow')==='0','Stale results advanced the new calculation');
+    while(!last){await until(()=>queued.length);queued.shift().deliver();}
+    assert(!bar(),'Replacement completion retained progress');
+    log('PASS: cancellation resets progress and stale worker results cannot advance the new view.');
+
+    app.setView({real:'-2',imag:'0',zoom:100});await until(bar);
+    await until(()=>queued.some(entry=>entry.data.type==='reference'));
+    assert(bar().getAttribute('aria-valuenow')==='0','Reference preparation counted as completed pixels');
+    app.dispose();assert(!bar(),'Disposal retained the progress bar');
+    log('PASS: slow deep zoom shows the bar at zero while preparing its reference; disposal removes it.');
   }catch(error){log(`FAIL: ${error.message}`);}
-  finally{window.Worker=RealWorker;app?.dispose();host.replaceChildren();}
+  finally{window.Worker=RealWorker;app?.dispose();host.removeEventListener('mandelbrot-frame',onFrame);
+    history.replaceState(history.state,'',oldURL);host._mandelbrotView=oldView;
+    host.replaceChildren();if(oldStyle===null)host.removeAttribute('style');else host.setAttribute('style',oldStyle);}
 };
 document.getElementById('adaptive-resize').onclick=async()=>{
   const RealWorker=window.Worker,host=document.getElementById('slow');let app,slow=false;

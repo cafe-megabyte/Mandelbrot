@@ -115,6 +115,55 @@ export function previewTransform(before,after,width,height) {
   const x=fixedNumber(dr,bits+e)/denominator,y=-fixedNumber(di,bits+e)/denominator;
   return `translate(${x}px,${y}px) scale(${factor})`;
 }
+// Conjugate pixels can share a result only when reflection maps pixel centres
+// to pixel centres. Test the binary ratio exactly; never snap a panned view.
+export function renderBands(height, view, tileHeight = 64) {
+  const bytes = new DataView(new ArrayBuffer(8));
+  function binary(value) {
+    bytes.setFloat64(0, value);
+    const high = bytes.getUint32(0), low = bytes.getUint32(4), e = (high >>> 20) & 2047;
+    let n = (BigInt(high & 0xfffff) << 32n) | BigInt(low);
+    if (e) n |= 1n << 52n;
+    if (high >>> 31) n = -n;
+    return {n, exponent: e ? e - 1075 : -1074};
+  }
+  let {n: numerator, exponent} = view.deep ? {n: BigInt(view.imag), exponent: -view.bits} : binary(view.centreImag);
+  const scale = binary(view.mantissa);
+  let denominator = scale.n;
+  const shift = exponent + 1 - (view.exponent + scale.exponent);
+  if (shift >= 0) numerator <<= BigInt(shift);
+  else denominator <<= BigInt(-shift);
+  const offset = numerator / denominator;
+  const aligned = numerator % denominator === 0n && offset > -BigInt(height) && offset < BigInt(height);
+  const sum = aligned ? height - 1 + Number(offset) : -1;
+  const upper = sum >= height - 1;
+  const spacing = view.mantissa * 2 ** view.exponent;
+  const imaginary = y => view.centreImag + (height / 2 - (y + 0.5)) * spacing;
+  function mirror(y) {
+    const other = sum - y;
+    if (!aligned || other < 0 || other >= height || other === y) return -1;
+    // Addition/multiplication may round differently in the shallow C path.
+    // Reuse only exactly opposite sampled doubles, including signed zero.
+    return view.deep || imaginary(y) === -imaginary(other) ? other : -1;
+  }
+  const bands = [];
+  let computedRows = 0;
+  const copied = (y, other) => other >= 0 && (upper ? other < y : other > y);
+  for (let y = 0; y < height;) {
+    const other = mirror(y);
+    if (copied(y, other)) { ++y; continue; }
+    const paired = other >= 0, start = y++;
+    while (y < height && y - start < tileHeight) {
+      const next = mirror(y);
+      if (copied(y, next) || (next >= 0) !== paired) break;
+      ++y;
+    }
+    const rows = y - start;
+    computedRows += rows;
+    bands.push({y: start, height: rows, mirrorY: paired ? sum - (y - 1) : null});
+  }
+  return {bands, computedRows, mirroredRows: height - computedRows};
+}
 export function writeCentre(engine,view) {
   const n=engine.deep_digits(),out=new Uint32Array(engine.memory.buffer,engine.deep_input_address(),2*n);
   out.fill(0);

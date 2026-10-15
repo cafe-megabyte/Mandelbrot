@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>PNG buffers and offline verification checks</title>
+<style>body{font:14px system-ui;margin:24px}pre{white-space:pre-wrap}.picture{position:relative;width:700px;height:361px}.picture>div{position:absolute;inset:0}.picture canvas{position:absolute;display:none}</style>
+<button id="run">Check PNG buffers, pixels and offline verification</button>
+<pre id="report"></pre><div id="host" class="picture"></div>
+<script type="module">
+const report=document.getElementById('report'), button=document.getElementById('run');
+const assert=(ok,message)=>{if(!ok)throw new Error(message);};
+const log=message=>report.textContent+=`${message}\n`;
+const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const source=new URL(new URLSearchParams(location.search).get('source')||'/web/',location.href);
+let releaseBase, serviceText;
+function pattern(x,y,c){return c===0?x&255:c===1?y&255:c===2?(x*13+y*7)&255:255;}
+function pixels(w,h,startX=0,startY=0,buffer){
+  const output=new Uint8Array(buffer||new ArrayBuffer(w*h*4),0,w*h*4);
+  for(let y=0;y<h;++y)for(let x=0;x<w;++x)for(let c=0;c<4;++c)output[(y*w+x)*4+c]=pattern(startX+x,startY+y,c);
+  return output;
+}
+async function validate(blob,width,height){
+  const bytes=new Uint8Array(await blob.arrayBuffer()),view=new DataView(bytes.buffer);
+  assert(bytes.slice(0,8).join(',')==='137,80,78,71,13,10,26,10','PNG signature');
+  for(let offset=8;offset<bytes.length;){
+    const length=view.getUint32(offset);let crc=0xffffffff;
+    for(let i=offset+4;i<offset+8+length;++i){crc^=bytes[i];for(let bit=0;bit<8;++bit)crc=crc&1?(crc>>>1)^0xedb88320:crc>>>1;}
+    assert(((crc^0xffffffff)>>>0)===view.getUint32(offset+8+length),'PNG chunk CRC');offset+=length+12;
+  }
+  const bitmap=await createImageBitmap(blob),canvas=document.createElement('canvas');
+  canvas.width=width;canvas.height=height;const context=canvas.getContext('2d');context.drawImage(bitmap,0,0);bitmap.close();
+  const actual=context.getImageData(0,0,width,height).data;
+  for(let y=0;y<height;++y)for(let x=0;x<width;++x)for(let c=0;c<4;++c)
+    assert(actual[(y*width+x)*4+c]===pattern(x,y,c),`PNG byte ${x},${y},${c}`);
+  canvas.width=0;
+}
+async function workerCheck(width,height,compression){
+  let allocations=0,returns=0;
+  const result=await new Promise((resolve,reject)=>{
+    const worker=new Worker(new URL('png-worker.js',releaseBase),{type:'module'});
+    const timer=setTimeout(()=>finish(new Error('PNG timed out')),10000);
+    function finish(error,value){clearTimeout(timer);worker.terminate();error?reject(error):resolve(value);}
+    worker.onerror=event=>finish(new Error(event.message));
+    worker.onmessage=({data})=>{try{
+      if(data.type==='error')throw new Error(data.message);
+      if(data.type==='complete'){finish(null,data);return;}
+      assert(data.type==='next','Unexpected PNG message');
+      if(data.buffer){++returns;assert(data.buffer.byteLength===width*Math.min(32,height)*4,'Recycled buffer capacity changed');}
+      else ++allocations;
+      const buffer=data.buffer||new ArrayBuffer(width*Math.min(32,height)*4);
+      pixels(width,data.height,0,data.y,buffer);
+      worker.postMessage({type:'band',y:data.y,height:data.height,buffer},[buffer]);
+      assert(buffer.byteLength===0,'RGBA strip was cloned instead of transferred');
+    }catch(error){finish(error);}};
+    worker.postMessage({type:'init',width,height,compression});
+  });
+  assert(allocations===1,'More than one transfer buffer allocated');
+  assert(returns===Math.ceil(height/32)-1,'A strip buffer was not returned');
+  assert(result.metrics.filterBufferAllocations===1,'Filter workspace was reallocated');
+  assert(result.metrics.filterBufferBytes===(width*4+1)*Math.min(32,height),'Filter workspace is not bounded');
+  assert(result.metrics.inputBytes===width*height*4,'Incorrect encoder input byte accounting');
+  assert(result.metrics.chunkBytes===result.blob.size,'Incorrect PNG byte accounting');
+  await validate(result.blob,width,height);
+  log(`PASS ${compression}: ${width}x${height}, every RGBA byte and CRC, one transfer buffer and one filter buffer.`);
+}
+async function imageExportCheck(){
+  const {createImageExport}=await import(new URL('image-export.js',releaseBase));
+  const host=document.getElementById('host'),width=2051,height=1057,layer=document.createElement('div'),surfaces=new Map(),canvases=[];
+  for(let y=0;y<height;y+=1024)for(let x=0;x<width;x+=1024){
+    const canvas=document.createElement('canvas');canvas.width=Math.min(1024,width-x);canvas.height=Math.min(1024,height-y);
+    const context=canvas.getContext('2d',{alpha:false});
+    context.putImageData(new ImageData(new Uint8ClampedArray(pixels(canvas.width,canvas.height,x,y).buffer),canvas.width,canvas.height),0,0);
+    surfaces.set(`${x/1024},${y/1024}`,{context});layer.append(canvas);canvases.push(canvas);
+  }
+  host.append(layer);const frame={width,height,layer,surfaces},exporter=createImageExport(host,candidate=>candidate===frame);
+  const completed=new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Image export timed out')),15000);
+    host.addEventListener('mandelbrot-export',event=>{clearTimeout(timer);resolve(event.detail);},{once:true});});
+  exporter.prepare(frame);const detail=await completed;
+  assert(detail.transferBufferAllocations===1,'Image exporter did not recycle strips');
+  assert(detail.readbackCalls===Math.ceil(width/1024)*Math.ceil(height/32),'Readback count');
+  assert(detail.readbackBytes===width*height*4,'Readback byte count');
+  assert(detail.encoder.inputBytes===detail.readbackBytes,'Pixels were dropped between canvas and encoder');
+  assert(surfaces.size===0&&canvases.every(canvas=>canvas.width===0&&!canvas.isConnected),'Canvas backing stores not released');
+  const image=layer.querySelector('img'),response=await fetch(image.src);await validate(await response.blob(),width,height);
+  const menu=new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2});
+  assert(image.dispatchEvent(menu)&&!menu.defaultPrevented,'Native image menu was prevented');
+  const url=image.src;layer.remove();await delay(0);let revoked=false;try{await fetch(url);}catch{revoked=true;}
+  assert(revoked,'Retired PNG URL was retained');exporter.dispose();
+  const disabled=createImageExport(host,()=>true,{enabled:false});disabled.prepare(frame);
+  assert(host.dataset.exportState==='disabled','Render-only export option was ignored');disabled.dispose();
+  log('PASS automatic tiled Canvas export: surface boundaries, metrics, pixels, native menu, released Canvas stores and retired object URL.');
+}
+async function verificationCheck(){
+  const handlers=new Map(),entries=new Map(),network=new Map();let bodyReads=0,fetches=0;
+  const cache={async match(url){const response=entries.get(String(url));if(!response)return;const copy=response.clone();
+      return {ok:copy.ok,json:()=>copy.json(),arrayBuffer:()=>{++bodyReads;return copy.arrayBuffer();}};},
+    async delete(url){return entries.delete(String(url));},async put(url,response){entries.set(String(url),response.clone());}};
+  const self={location:{href:'https://example.test/app/service-worker.js'},addEventListener:(name,handler)=>handlers.set(name,handler)};
+  const api=new Function('self','caches','fetch',serviceText+'\nreturn {complete,REQUIRED,RELEASE,BASE,INVENTORY,COMPLETE};')(
+    self,{open:async()=>cache},async url=>{++fetches;const response=network.get(String(url));if(!response)throw new Error('Missing fixture');return response.clone();});
+  const resources=[];
+  for(const name of api.REQUIRED){
+    const body=name.endsWith('.wasm')?new Uint8Array([0,97,115,109,1,0,0,0]):
+      new TextEncoder().encode(name==='index.html'?`const DOCUMENT_RELEASE = '${api.RELEASE}'`:name);
+    const path=`releases/${api.RELEASE}/${name}`,url=new URL(path,api.BASE).href,response=new Response(body);
+    resources.push({path,size:body.byteLength});entries.set(url,response.clone());network.set(url,response);
+  }
+  const inventory=new Response(JSON.stringify({release:api.RELEASE,resources}));
+  entries.set(api.INVENTORY,inventory.clone());network.set(api.INVENTORY,inventory);entries.set(api.COMPLETE,new Response(api.RELEASE));
+  const first=api.complete(),second=api.complete();assert(first===second,'Concurrent scans do not share a promise');
+  assert((await Promise.all([first,second,api.complete()])).every(Boolean),'Complete fixture rejected');
+  assert(bodyReads===resources.length,'Concurrent status checks reread resource bodies');
+  const missing=new URL(resources[0].path,api.BASE).href;entries.delete(missing);
+  assert(!await api.complete(),'A later verification ignored eviction');
+  function message(type){return new Promise((resolve,reject)=>{handlers.get('message')({data:{type},ports:[{postMessage:resolve}],waitUntil:promise=>promise.catch(reject)});});}
+  const repaired=await Promise.all([message('repair'),message('repair')]);
+  assert(repaired.every(value=>value.ready),'Repair did not verify the complete package');
+  assert(fetches===resources.length+1,'Concurrent repairs duplicated the download');
+  entries.delete(missing);assert(!(await message('status')).ready,'Later status permanently cached ready=true');
+  log('PASS offline verification: shared concurrent scan, later eviction detection, shared repair, fresh post-repair verification.');
+}
+button.onclick=async()=>{
+  button.disabled=true;report.textContent='';document.body.dataset.state='running';
+  try{
+    const response=await fetch(new URL('service-worker.js',source));assert(response.ok,'Missing service-worker source');serviceText=await response.text();
+    const release=/const RELEASE = '([^']+)'/.exec(serviceText)?.[1];assert(release,'Missing release');
+    releaseBase=new URL(release==='__RELEASE__'?'./':`releases/${release}/`,source);
+    for(const compression of ['deflate','store'])for(const [w,h]of[[1,1],[137,32],[137,73],[513,65]])await workerCheck(w,h,compression);
+    await imageExportCheck();await verificationCheck();document.body.dataset.state='complete';log('ALL CHECKS PASSED');
+  }catch(error){document.body.dataset.state='failed';log(`FAIL: ${error.stack||error.message}`);}finally{button.disabled=false;}
+};
+</script>
+</html>

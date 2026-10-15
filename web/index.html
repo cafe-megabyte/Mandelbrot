@@ -24,14 +24,15 @@
   </style>
 </head>
 <body>
-  <main id="fractal" role="img" aria-label="A colourful Mandelbrot set"></main>
+  <main id="fractal" role="group" aria-label="A colourful Mandelbrot set"></main>
   <script type="module">
     // The shell stays black until the controlling worker verifies its complete
     // offline package. Runtime imports always use THAT worker's release.
     const DOCUMENT_RELEASE = '__RELEASE__';
     const root = document.getElementById('fractal');
     const base = new URL('./', location.href);
-    let registration, instance, activeRelease, running = false, requested = false;
+    let registration, instance, activeRelease, activeController, verifiedAt = 0;
+    let running = false, requested = false, forceRequested = false;
 
     function status(worker, repair = false) {
       return new Promise((resolve, reject) => {
@@ -41,33 +42,44 @@
         worker.postMessage({type: repair ? 'repair' : 'status'}, [channel.port2]);
       });
     }
-    async function refresh() {
+    async function refresh(force = false) {
       requested = true;
+      forceRequested ||= force === true;
       if (running) return;
       running = true;
       try {
         while (requested) {
           requested = false;
+          const verify = forceRequested; forceRequested = false;
           const controller = navigator.serviceWorker.controller;
           if (!controller) continue;
+          // A running renderer already passed the full startup check. Focus
+          // events within the same five-minute window need no repeated scan.
+          // New documents/controllers, reconnection and periodic checks still
+          // verify all bytes, so cache eviction is never permanently hidden.
+          if (!verify && instance && root.dataset.state !== 'failed' && controller === activeController &&
+              performance.now() - verifiedAt < 5 * 60 * 1000) continue;
           let state = await status(controller);
           if (!state.ready && navigator.onLine) state = await status(controller, true);
           if (!state.ready || !/^[a-f0-9-]{36}$/.test(state.release)) continue;
           if (navigator.serviceWorker.controller !== controller) { requested = true; continue; }
-          if (state.release === activeRelease) continue;
+          if (state.release === activeRelease && root.dataset.state !== 'failed') {
+            activeController = controller; verifiedAt = performance.now(); continue;
+          }
           const app = await import(new URL(`releases/${state.release}/app.js`, base));
           const next = await app.start(root);
           if (navigator.serviceWorker.controller !== controller) { next.dispose(); requested = true; continue; }
           instance?.dispose(); instance = next; activeRelease = state.release;
+          activeController = controller; verifiedAt = performance.now();
           root.dataset.release = activeRelease;
         }
       } catch (error) { console.error('Mandelbrot startup:', error); }
       finally { running = false; }
     }
-    function update() {
+    function update(event) {
       if (!document.hidden) {
         registration?.update().catch(error => console.debug('Mandelbrot update:', error.message));
-        refresh();
+        refresh(event?.type === 'online' || (event?.type === 'pageshow' && event.persisted));
       }
     }
     if ('serviceWorker' in navigator && isSecureContext) {

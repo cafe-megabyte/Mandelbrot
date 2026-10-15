@@ -2,12 +2,45 @@ import {createResizeScheduler} from './resize-scheduler.js';
 import {createImageExport} from './image-export.js';
 import {createView, previewTransform, viewFragment, viewFromFragment} from './view.js';
 import {createNavigation} from './navigation.js';
+import {createTileQueue} from './tile-queue.js';
 
 const TILE_WIDTH = 256, TILE_HEIGHT = 64, SURFACE_SIZE = 1024;
+// Keep the scheduling fallback aligned with the verified core default.
+// Explicit engineOptions allow independent optimization experiments.
+const DEFAULT_ENGINE_OPTIONS = 3851;
 
-export async function start(root) {
+function usePreciseSeries(view, options) {
+  // snapshot's mantissa is in [1,2); core normalization adds one to exponent.
+  return view.deep && view.exponent >= -51 && view.exponent <= -27 &&
+    ((options.engineOptions === undefined ? DEFAULT_ENGINE_OPTIONS : options.engineOptions) & 1024) !== 0;
+}
+
+function useCompactTiles(view, options) {
+  if (options.compactTiles !== undefined) return options.compactTiles === true;
+  // Compact footprints retain more certificates and accurate series steps.
+  const certificate = view.deep && view.exponent >= -50 && view.exponent <= -26 &&
+    ((options.engineOptions === undefined ? DEFAULT_ENGINE_OPTIONS : options.engineOptions) & 512) !== 0;
+  return certificate || usePreciseSeries(view, options);
+}
+
+function minimumTilePixels(view, options, compactTiles = useCompactTiles(view, options)) {
+  if (options.minTilePixels !== undefined) return options.minTilePixels;
+  return compactTiles && usePreciseSeries(view, options) ? 256 : 1;
+}
+
+export async function start(root, options = {}) {
   let disposed = false, pending, frameRequest = 0;
-  let physicalSize, replacementCount = 0, fullscreenPending = false, referenceWorker, viewURL = location.hash;
+  let physicalSize, replacementCount = 0, fullscreenPending = false, referenceWorker, referenceIterations = 0;
+  let referencePreparing = false, viewURL = location.hash;
+  let progress, progressFill, progressPill, progressCompleted, progressPercent, progressTotal;
+  const progressLanguage = (navigator.languages?.[0] || navigator.language || 'en')
+    .toLowerCase().split('-')[0] === 'de' ? 'de' : 'en';
+  const progressCopy = progressLanguage === 'de'
+    ? {action: 'Berechne', pixels: 'Pixel', label: 'Fortschritt der Bildberechnung'}
+    : {action: 'Calculating', pixels: 'pixels', label: 'Image calculation progress'};
+  const progressFormatter = new Intl.NumberFormat(progressLanguage === 'de' ? 'de-DE' : 'en-US',
+    {useGrouping: true, maximumFractionDigits: 0});
+  const progressNumber = value => progressFormatter.format(value);
   const view = createView(root._mandelbrotView);
   const linkedView = viewFromFragment(location.hash);
   if (!root._mandelbrotView && linkedView) view.set(linkedView);
@@ -16,9 +49,9 @@ export async function start(root) {
   const backend = WebAssembly.validate(simdBytes) ? 'simd128' : 'scalar';
   const module = await WebAssembly.compile(backend === 'simd128' ? simdBytes : await loadBytes('engine-scalar.wasm'));
   if (WebAssembly.Module.imports(module).length) throw new Error('Unexpected WASM imports');
-  const workerCount = Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 2) - 1));
+  const workerCount = Math.max(1, Math.min(8, options.workers || (navigator.hardwareConcurrency || 2) - 1));
   const imageExport = createImageExport(root, frame => !disposed && pending === frame &&
-    frame.completed === frame.total && frame.shown && root.dataset.resizeMode === 'idle');
+    frame.completed === frame.total && frame.shown && root.dataset.resizeMode === 'idle', options.export);
   const scheduler = createResizeScheduler({
     start: (size, job) => { try { render(size, job); } catch (error) { fail(error); } },
     cancel: cancelRender,
@@ -56,11 +89,13 @@ export async function start(root) {
   function newSlot() {
     return new Promise((resolve, reject) => {
       const worker = new Worker(new URL('./engine-worker.js', import.meta.url), {type: 'module'});
-      const slot = {worker, busy: false, job: null, ready: false};
+      const slot = {worker, busy: false, job: null, ready: false,
+        buffers: [new ArrayBuffer(TILE_WIDTH * TILE_HEIGHT * 4), new ArrayBuffer(TILE_WIDTH * TILE_HEIGHT * 4)]};
       slots.push(slot);
       const timer = setTimeout(() => { worker.terminate(); reject(new Error('Worker startup timed out')); }, 15000);
       slot.timer = timer;
       worker.onmessage = ({data}) => {
+        if (disposed || !slots.includes(slot)) return;
         if (data.type === 'ready') {
           clearTimeout(timer); slot.ready = true; resolve(slot); dispatch(slot); return;
         }
@@ -70,15 +105,51 @@ export async function start(root) {
           return;
         }
         if (data.type !== 'tile') return;
+        const job = slot.job;
         slot.busy = false; slot.job = null;
-        if (!disposed && pending && data.generation === pending.id && scheduler.accept(data.generation)) {
-          const surface = pending.surfaces.get(`${Math.floor(data.x / SURFACE_SIZE)},${Math.floor(data.y / SURFACE_SIZE)}`);
+        if (!disposed && pending && data.generation === pending.generation && scheduler.accept(pending.id)) {
+          const frame = pending;
+          frame.precisionHint = Math.max(frame.precisionHint || 0, data.precisionBits || 0);
+          frame.queue.observe(data.timing?.computeMilliseconds, data.width * data.height);
+          frame.tileTimes.push(data.timing?.computeMilliseconds || 0);
+          frame.workerMilliseconds += data.timing?.computeMilliseconds || 0;
+          frame.copyMilliseconds += data.timing?.copyMilliseconds || 0;
+          frame.roundTripMilliseconds += performance.now() - slot.sentAt;
+          slot.memoryBytes = data.memoryBytes || 0;
+          slot.referenceBytes = data.referenceBytes || 0;
+          for (const [key,value] of Object.entries(data.stats || {}))
+            frame.stats[key] = (frame.stats[key] || 0) + value;
+          // The spare buffer lets computation overlap main-thread presentation.
+          // data.buffer remains owned here until every putImageData has returned.
+          if (options.pipeline !== false) dispatch(slot);
+          if (pending !== frame) { dispatch(slot,data.buffer); return; }
+          const presentationStarted = performance.now();
           const pixels = new Uint8ClampedArray(data.buffer, 0, data.width * data.height * 4);
-          surface.context.putImageData(new ImageData(pixels, data.width, data.height),
-            data.x % SURFACE_SIZE, data.y % SURFACE_SIZE);
+          putPixels(pending, data.x, data.y, data.width, data.height, pixels);
+          let completedPixels = data.width * data.height;
+          if (job.mirrorY !== null) {
+            const stride = data.width * 4;
+            const reflected = pending.mirrorBuffer.subarray(0, pixels.length);
+            for (let row = 0; row < data.height; ++row)
+              reflected.set(pixels.subarray(row * stride, (row + 1) * stride), (data.height - 1 - row) * stride);
+            putPixels(pending, data.x, job.mirrorY, data.width, data.height, reflected);
+            completedPixels *= 2;
+          }
           ++pending.completed;
+          pending.completedPixels += completedPixels;
+          updateProgress(pending);
           pending.skipped = (pending.skipped || 0) + (data.skipped || 0);
           pending.fallbacks = (pending.fallbacks || 0) + (data.fallbacks || 0);
+          pending.presentationMilliseconds += performance.now() - presentationStarted;
+          if (frame.firstTileMilliseconds === undefined) {
+            frame.firstTileMilliseconds = performance.now() - frame.started;
+            root.dispatchEvent(new CustomEvent('mandelbrot-first-tile', {bubbles: true, detail: {
+              generation: frame.generation, width: frame.width, height: frame.height,
+              milliseconds: frame.firstTileMilliseconds, phase: frame.preview ? 'preview' : frame.kind,
+              zoom: frame.view.zoom
+            }}));
+            if (pending !== frame) { dispatch(slot, data.buffer); return; }
+          }
           if (pending.completed === pending.total) finish();
         }
         dispatch(slot, data.buffer);
@@ -89,56 +160,151 @@ export async function start(root) {
         else lostSlot(slot, error);
       };
       worker.onmessageerror = () => lostSlot(slot, new Error('Worker message could not be decoded'));
-      worker.postMessage({type: 'init', module});
+      worker.postMessage({type: 'init', module, engineOptions: options.engineOptions});
     });
   }
 
   function lostSlot(slot, error) {
     if (disposed || !slots.includes(slot)) return;
     console.error('Mandelbrot worker:', error);
-    if (slot.job && pending && slot.job.generation === pending.id) pending.retry.push(slot.job);
+    if (slot.job && pending && slot.job.generation === pending.generation) pending.retry.push(slot.job);
     slot.worker.terminate(); slots.splice(slots.indexOf(slot), 1);
     if (++replacementCount <= 2) newSlot().catch(fail);
     else fail(error);
   }
 
   function dispatch(slot, buffer) {
-    if (buffer) slot.buffer = buffer;
-    if (disposed || !pending || slot.busy || !slot.ready || pending.completed === pending.total) return;
+    if (disposed || !slots.includes(slot)) return;
+    if (buffer) slot.buffers.push(buffer);
+    if (!pending || slot.busy || !slot.ready || pending.completed === pending.total) return;
     if (!scheduler.accept(pending.id)) return;
+    if (pending.view.perturb && !pending.reference) return;
     let job = pending.retry.pop();
     if (!job) {
-      if (pending.next === pending.total) return;
-      const index = pending.next++, cols = Math.ceil(pending.width / TILE_WIDTH);
-      const x = (index % cols) * TILE_WIDTH, y = Math.floor(index / cols) * TILE_HEIGHT;
-      job = {type: 'render', generation: pending.id, frameWidth: pending.width, frameHeight: pending.height,
-        view: pending.view,
-        x, y, width: Math.min(TILE_WIDTH, pending.width - x), height: Math.min(TILE_HEIGHT, pending.height - y)};
+      const tile = pending.queue.take();
+      pending.total = pending.queue.total;
+      if (!tile) return;
+      job = {type: 'render', generation: pending.generation, ...tile};
     }
-    if (pending.view.perturb && !pending.reference) { pending.retry.push(job); return; }
-    if (pending.view.perturb && slot.referenceGeneration !== pending.id) {
-      slot.worker.postMessage({type: 'reference', generation: pending.id, bits: pending.reference.bits,
+    if (pending.view.perturb && slot.referenceGeneration !== pending.generation) {
+      slot.worker.postMessage({type: 'reference', generation: pending.generation, bits: pending.reference.bits,
         view: pending.view, buffer: pending.reference.buffer});
-      slot.referenceGeneration = pending.id;
+      slot.referenceGeneration = pending.generation;
+    }
+    if (slot.configuredGeneration !== pending.generation) {
+      slot.worker.postMessage({type:'configure', generation:pending.generation, view:pending.view,
+        frameWidth:pending.width, frameHeight:pending.height, precisionHint:pending.precisionHint});
+      slot.configuredGeneration = pending.generation;
     }
     slot.busy = true; slot.job = job;
     if (pending.view.deep) slot.memoryIterations = Math.max(slot.memoryIterations || 0,pending.view.iterations);
-    const transfer = slot.buffer; slot.buffer = null;
-    slot.worker.postMessage({...job, buffer: transfer}, transfer ? [transfer] : []);
+    const transfer = slot.buffers.pop();
+    slot.sentAt = performance.now();
+    slot.worker.postMessage({...job, precisionHint:pending.precisionHint, buffer: transfer}, transfer ? [transfer] : []);
+  }
+
+  function putPixels(frame, x, y, width, height, pixels) {
+    for (let row = 0; row < height;) {
+      const targetY = y + row, rows = Math.min(height - row, SURFACE_SIZE - targetY % SURFACE_SIZE);
+      const surface = frame.surfaces.get(`${Math.floor(x / SURFACE_SIZE)},${Math.floor(targetY / SURFACE_SIZE)}`);
+      const part = pixels.subarray(row * width * 4, (row + rows) * width * 4);
+      surface.context.putImageData(new ImageData(part, width, rows), x % SURFACE_SIZE, targetY % SURFACE_SIZE);
+      row += rows;
+    }
+  }
+
+  function updateProgress(frame) {
+    if (!progress) return;
+    const total = frame.width * frame.height, fraction = frame.completedPixels / total;
+    const percent = String(Math.floor(100 * fraction));
+    const completed = progressNumber(frame.completedPixels);
+    progressCompleted.textContent = completed;
+    progressPercent.textContent = percent;
+    progress.setAttribute('aria-valuenow', percent);
+    progress.setAttribute('aria-valuetext',
+      `${progressCopy.action} ${completed} / ${progressTotal} ${progressCopy.pixels} • ${percent}%`);
+    progressFill.style.transform = `scaleX(${fraction})`;
+  }
+  function showProgress(frame) {
+    if (disposed || pending !== frame || frame.completed === frame.total) return;
+    progressPill = document.createElement('div'); progressPill.className = 'render-progress-pill';
+    progressPill.setAttribute('lang', progressLanguage);
+    Object.assign(progressPill.style, {position: 'absolute', left: '50%', bottom: 'max(24px, env(safe-area-inset-bottom))',
+      transform: 'translateX(-50%)', width: 'max-content', maxWidth: 'calc(100% - 24px)', boxSizing: 'border-box',
+      padding: '10px 18px 12px', borderRadius: '999px', background: '#111318', color: '#f4f7ff',
+      border: '1px solid rgba(255,255,255,0.28)', boxShadow: '0 3px 18px rgba(0,0,0,0.65)',
+      font: '500 12px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      fontVariantNumeric: 'tabular-nums lining-nums', fontFeatureSettings: '"tnum" 1, "lnum" 1',
+      pointerEvents: 'none', zIndex: '1'});
+    const label = document.createElement('div'); label.className = 'render-progress-label';
+    label.setAttribute('aria-hidden', 'true');
+    Object.assign(label.style, {display: 'flex', flexWrap: 'wrap', justifyContent: 'center',
+      alignItems: 'baseline', columnGap: '0.35em', rowGap: '2px', marginBottom: '8px', textAlign: 'center'});
+    const action = document.createElement('span'); action.textContent = progressCopy.action;
+    const counts = document.createElement('span'); counts.style.whiteSpace = 'pre';
+    progressTotal = progressNumber(frame.width * frame.height);
+    const countSlot = document.createElement('span');
+    Object.assign(countSlot.style, {display: 'inline-block', position: 'relative'});
+    const countSizer = document.createElement('span'); countSizer.textContent = progressTotal;
+    countSizer.style.visibility = 'hidden';
+    progressCompleted = document.createElement('span'); progressCompleted.className = 'render-progress-count';
+    // Measure the final grouped number, including the font's actual separators.
+    // Overlay the changing count so another digit cannot resize the sentence.
+    Object.assign(progressCompleted.style, {position: 'absolute', inset: '0', textAlign: 'right'});
+    countSlot.append(countSizer, progressCompleted);
+    const separator = document.createElement('span'); separator.textContent = '\u00a0/\u00a0';
+    const total = document.createElement('span'); total.className = 'render-progress-total';
+    total.textContent = progressTotal;
+    counts.append(countSlot, separator, total);
+    const tail = document.createElement('span');
+    Object.assign(tail.style, {display: 'inline-flex', alignItems: 'baseline', columnGap: '0.35em', whiteSpace: 'nowrap'});
+    const pixels = document.createElement('span'); pixels.textContent = progressCopy.pixels;
+    const bullet = document.createElement('span'); bullet.className = 'render-progress-separator'; bullet.textContent = '•';
+    const percentage = document.createElement('span');
+    Object.assign(percentage.style, {display: 'inline-block', width: 'calc(3ch + 1em)', textAlign: 'left'});
+    progressPercent = document.createElement('span'); progressPercent.className = 'render-progress-percent';
+    const percentSign = document.createElement('span'); percentSign.textContent = '%';
+    percentage.append(progressPercent, percentSign);
+    tail.append(pixels, bullet, percentage);
+    label.append(action, counts, tail);
+    progress = document.createElement('div'); progress.className = 'render-progress';
+    progress.setAttribute('role', 'progressbar');
+    progress.setAttribute('aria-label', progressCopy.label);
+    progress.setAttribute('aria-valuemin', '0'); progress.setAttribute('aria-valuemax', '100');
+    Object.assign(progress.style, {height: '6px', borderRadius: '3px',
+      background: '#3b414c', overflow: 'hidden', pointerEvents: 'none'});
+    progressFill = document.createElement('div');
+    Object.assign(progressFill.style, {height: '100%', background: '#b4ffff', transformOrigin:'left'});
+    progress.append(progressFill); progressPill.append(label, progress); root.append(progressPill); updateProgress(frame);
+  }
+  function hideProgress(frame) {
+    clearTimeout(frame?.progressTimer);
+    progressPill?.remove(); progress = progressFill = progressPill = progressCompleted = progressPercent = progressTotal = null;
   }
 
   function reveal(frame) {
     if (disposed || pending !== frame || frame.shown) return;
     frame.shown = true; frame.layer.style.visibility = 'visible';
     frame.layer.style.transform = previewTransform(frame.view, currentView(), root.clientWidth, root.clientHeight);
-    for (const child of [...root.children]) if (child !== frame.layer) child.remove();
+    for (const child of [...root.children]) if (child !== frame.layer && child !== progressPill) {
+      releaseSurfaces(child._frame); child.remove();
+    }
     root.dataset.exportState = 'pending';
   }
 
   function finish() {
     const frame = pending;
+    clearTimeout(frame.previewTimer);
+    if (frame.reference) frame.reference.buffer = null;
+    if (frame.preview) {
+      reveal(frame);
+      root.dispatchEvent(new CustomEvent('mandelbrot-preview', {bubbles:true,detail:{
+        width:frame.width,height:frame.height,milliseconds:performance.now()-frame.started,zoom:frame.view.zoom}}));
+      advanceFinal(frame);
+      return;
+    }
     if (!scheduler.complete(frame.id)) return;
-    clearTimeout(frame.revealTimer); reveal(frame);
+    clearTimeout(frame.revealTimer); hideProgress(frame); reveal(frame);
     root.dataset.state = 'complete';
     root.dispatchEvent(new CustomEvent('mandelbrot-frame', {bubbles: true, detail: {
       width: frame.width, height: frame.height, milliseconds: performance.now() - frame.started,
@@ -146,9 +312,37 @@ export async function start(root) {
       zoom: frame.view.zoom, iterations: frame.view.iterations, deep: frame.view.deep,
       algorithm: frame.view.perturb ? 'perturbation/BLA' : frame.view.deep ? 'tile perturbation/BLA + double-double' : backend,
       referenceMilliseconds: frame.reference?.milliseconds || 0,
-      skippedIterations: frame.skipped || 0, preciseFallbacks: frame.fallbacks || 0
+      computedPixels: frame.computedRows * frame.width, mirroredPixels: frame.mirroredRows * frame.width,
+      skippedIterations: frame.skipped || 0, preciseFallbacks: frame.fallbacks || 0,
+      firstTileMilliseconds:frame.firstTileMilliseconds, presentationMilliseconds:frame.presentationMilliseconds,
+      workerMilliseconds:frame.workerMilliseconds, copyMilliseconds:frame.copyMilliseconds,
+      roundTripMilliseconds:frame.roundTripMilliseconds, stats:frame.stats,
+      tileCount:frame.total, compactTiles:frame.compactTiles, minTilePixels:frame.minTilePixels,
+      tileMilliseconds:tileSummary(frame.tileTimes),
+      wasmMemoryBytes:slots.reduce((sum,slot)=>sum+(slot.memoryBytes||0),0),
+      referenceBytes:frame.reference?.referenceBytes || 0,
+      referenceWorkerMemoryBytes:frame.reference?.memoryBytes || 0,
+      referenceCacheHit:frame.reference?.cacheHit || false,
+      retainedReferenceBytes:0, transferBufferBytes:workerCount*TILE_WIDTH*TILE_HEIGHT*8,
+      canvasBytes:frame.width*frame.height*4, canvasReadFrequently:frame.canvasReadFrequently,
+      previewMilliseconds:frame.job.previewMilliseconds || 0
     }}));
     if (frame.kind === 'final') imageExport.prepare(frame);
+  }
+
+  function advanceFinal(frame) {
+    if (pending!==frame || !scheduler.accept(frame.id)) return;
+    try { render(frame.finalSize,frame.job,true); } catch(error) { fail(error); }
+  }
+
+  function tileSummary(times) {
+    const sorted=[...times].sort((a,b)=>a-b);
+    return {median:sorted[Math.floor(sorted.length/2)]||0,p95:sorted[Math.floor(sorted.length*.95)]||0,max:sorted.at(-1)||0};
+  }
+  function releaseSurfaces(frame) {
+    if (!frame?.surfaces) return;
+    for (const {context} of frame.surfaces.values()) { context.canvas.width=0; context.canvas.remove(); }
+    frame.surfaces.clear();
   }
 
   function fail(error) {
@@ -157,23 +351,57 @@ export async function start(root) {
     root.dataset.state = 'failed';
   }
 
+  function destroyReference() {
+    referenceWorker?.terminate();
+    referenceWorker = null;
+    referenceIterations = 0;
+    referencePreparing = false;
+  }
+
+  function cancelReference() {
+    // A high-precision WASM batch cannot process a cancellation message until
+    // it returns. Kill active preparation promptly; keep a completed cache.
+    if (referencePreparing) destroyReference();
+    else referenceWorker?.postMessage({type: 'cancel'});
+  }
+
   function cancelRender(id) {
     if (pending?.id !== id) return;
+    hideProgress(pending);
     clearTimeout(pending.revealTimer);
-    if (!pending.shown) pending.layer.remove();
-    referenceWorker?.terminate(); referenceWorker = null;
-    if (!disposed && pending.view.deep) for (const slot of [...slots]) if (slot.job?.generation === id) {
+    clearTimeout(pending.previewTimer);
+    if (pending.reference) pending.reference.buffer=null;
+    if (!pending.shown) { releaseSurfaces(pending); pending.layer.remove(); }
+    cancelReference();
+    if (!disposed && pending.view.deep) for (const slot of [...slots]) if (slot.job?.generation === pending.generation) {
       slot.worker.terminate(); slots.splice(slots.indexOf(slot),1); newSlot().catch(fail);
     }
     pending = null;
   }
 
-  function render(size, job) {
+  function render(size, job, finalPass = false) {
     if (disposed || !size.width || !size.height) return;
+    const finalSize = size;
+    const preview = !finalPass && options.preview !== false && job.kind === 'final' &&
+      size.view.zoom >= 16 && size.width*size.height > 262144;
+    if (preview) {
+      const scale=2**Math.ceil(Math.log2(Math.max(size.width,size.height)/160));
+      const width=Math.max(1,Math.round(size.width/scale)),height=Math.max(1,Math.round(size.height/scale));
+      size={...size,width,height,view:{...view.snapshot(size.cssWidth,size.cssHeight,width,height),iterations:size.view.iterations}};
+    }
+    const compactTiles = useCompactTiles(size.view,options);
+    const requestedMinPixels = minimumTilePixels(size.view,options,compactTiles);
+    const queue = createTileQueue(size.width,size.height,size.view,
+      {adaptive:options.adaptiveTiles!==false,compact:compactTiles,minPixels:requestedMinPixels});
+    // Validate before allocating canvas backing stores. The queue rounds and
+    // clamps the optional floor; telemetry reports that effective value.
+    const minTilePixels = Math.max(1,Math.ceil(requestedMinPixels));
     imageExport.cancel();
+    hideProgress(pending);
     if (pending) {
       clearTimeout(pending.revealTimer);
-      if (!pending.shown) pending.layer.remove();
+      clearTimeout(pending.previewTimer);
+      if (!pending.shown) { releaseSurfaces(pending); pending.layer.remove(); }
     }
     const layer = document.createElement('div'); layer.className = 'frame';
     layer._view = size.view;
@@ -188,14 +416,22 @@ export async function start(root) {
         // smoothly while a new full-resolution calculation is deferred.
         Object.assign(canvas.style, {left: `${100 * x / size.width}%`, top: `${100 * y / size.height}%`,
           width: `${100 * width / size.width}%`, height: `${100 * height / size.height}%`});
-        const context = canvas.getContext('2d', {alpha: false});
-        if (!context) { layer.remove(); fail(new Error('Canvas allocation failed')); return; }
+        const context = canvas.getContext('2d', {alpha: false, willReadFrequently:!!options.willReadFrequently});
+        if (!context) {
+          canvas.width = 0; releaseSurfaces({surfaces}); layer.remove();
+          fail(new Error('Canvas allocation failed')); return;
+        }
         surfaces.set(`${x / SURFACE_SIZE},${y / SURFACE_SIZE}`, {context}); layer.append(canvas);
       }
     }
     root.append(layer);
-    pending = {...size, id: job.id, kind: job.kind, layer, surfaces, next: 0, completed: 0, retry: [], shown: false,
-      total: Math.ceil(size.width / TILE_WIDTH) * Math.ceil(size.height / TILE_HEIGHT), started: job.started};
+    pending = {...size, computedRows:queue.computedRows,mirroredRows:queue.mirroredRows, queue,
+      id: job.id, generation:job.id*2+(preview?0:1),kind: job.kind, layer, surfaces, completed: 0,
+      completedPixels: 0, retry: [], shown: false, mirrorBuffer: new Uint8ClampedArray(TILE_WIDTH * TILE_HEIGHT * 4),
+      total:queue.total, started:job.started,preview,finalSize,job,stats:{},tileTimes:[],
+      workerMilliseconds:0,copyMilliseconds:0,presentationMilliseconds:0,roundTripMilliseconds:0,
+      canvasReadFrequently:!!options.willReadFrequently,compactTiles,minTilePixels};
+    layer._frame=pending;
     root.dataset.state = 'rendering';
     root.dataset.phase = job.kind;
     root.dataset.zoom = String(size.view.zoom);
@@ -206,23 +442,45 @@ export async function start(root) {
       slot.worker.terminate(); slots.splice(slots.indexOf(slot),1); newSlot().catch(fail);
     }
     const frame = pending;
+    if (finalPass) job.previewMilliseconds=performance.now()-job.started;
+    if (preview) frame.previewTimer=setTimeout(()=>{
+      if(pending!==frame)return;
+      for(const slot of [...slots])if(slot.job?.generation===frame.generation){
+        slot.worker.terminate();slots.splice(slots.indexOf(slot),1);newSlot().catch(fail);
+      }
+      cancelReference();
+      advanceFinal(frame);
+    },200);
+    if (job.kind === 'final') frame.progressTimer = setTimeout(() => showProgress(frame),
+      Math.max(0, 500 - (performance.now() - frame.started)));
     // During navigation retain the complete transformed picture until the new
     // view is complete. Initial/window resize retain the existing presentation.
     if (job.kind === 'final' && !size.view.revision) frame.revealTimer = setTimeout(() => reveal(frame), 500);
     if (size.view.perturb) {
-      referenceWorker?.terminate();
-      const worker = new Worker(new URL('./reference-worker.js', import.meta.url), {type:'module'});
-      referenceWorker = worker;
+      if (referenceWorker && size.view.iterations*2<referenceIterations) {
+        destroyReference();
+      }
+      if (!referenceWorker) {
+        referenceWorker = new Worker(new URL('./reference-worker.js', import.meta.url), {type:'module'});
+        referenceWorker.postMessage({type:'init',module,engineOptions:options.engineOptions});
+      }
+      const worker = referenceWorker;
+      referenceIterations=Math.max(referenceIterations,size.view.iterations);
       worker.onmessage = ({data}) => {
-        if (disposed || pending !== frame || data.generation !== frame.id) return;
+        if (disposed || referenceWorker !== worker || data.generation !== frame.generation) return;
+        if (data.type !== 'reference' && data.type !== 'error') return;
+        referencePreparing = false;
+        if (pending !== frame) return;
         if (data.type === 'error') { fail(new Error(data.message)); return; }
-        frame.reference = data; worker.terminate(); if (referenceWorker === worker) referenceWorker = null;
+        frame.reference = data;
         for (const slot of slots) dispatch(slot);
       };
-      worker.onerror = event => fail(new Error(event.message || 'Reference worker failed'));
-      worker.postMessage({type:'init',module});
-      worker.postMessage({type:'prepare',generation:frame.id,view:frame.view,width:frame.width,height:frame.height});
-    }
+      worker.onerror = event => {
+        if (!disposed && referenceWorker === worker) fail(new Error(event.message || 'Reference worker failed'));
+      };
+      referencePreparing = true;
+      worker.postMessage({type:'prepare',generation:frame.generation,view:frame.view,width:frame.width,height:frame.height});
+    } else destroyReference();
     for (const slot of slots) dispatch(slot);
   }
 
@@ -288,14 +546,19 @@ export async function start(root) {
     disposed = true; observer.disconnect(); cancelAnimationFrame(frameRequest);
     scheduler.dispose();
     imageExport.dispose();
-    navigation.dispose(); referenceWorker?.terminate();
+    navigation.dispose(); destroyReference();
+    hideProgress(pending);
     clearTimeout(pending?.revealTimer);
-    if (pending && !pending.shown) pending.layer.remove();
+    clearTimeout(pending?.previewTimer);
+    if (pending && !pending.shown) { releaseSurfaces(pending); pending.layer.remove(); }
     densityQuery?.removeEventListener('change', densityChanged);
     window.removeEventListener('resize', resize); document.removeEventListener('visibilitychange', resume);
     window.removeEventListener('hashchange', restoreURL); window.removeEventListener('popstate', restoreURL);
     root.removeEventListener('click', enterFullscreen); document.removeEventListener('fullscreenchange', fullscreenChanged);
-    for (const slot of slots) { clearTimeout(slot.timer); slot.worker.terminate(); }
+    for (const slot of slots) {
+      clearTimeout(slot.timer); slot.worker.terminate(); slot.buffers.length = 0; slot.job = null;
+    }
+    slots.length = 0;
   }
 
   try { await Promise.all(Array.from({length: workerCount}, () => newSlot())); }

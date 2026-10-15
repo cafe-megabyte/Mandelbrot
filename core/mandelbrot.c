@@ -71,14 +71,98 @@ unsigned iteration_limit(void) { return limit; }
 double pixel_step(void) { return step; }
 const uint32_t *mandelbrot_output(void) { return output; }
 
-/* Strict inequalities with an error margin keep uncertain boundary points
- * in the orbit path. No guessed periodicity or region filling is used. */
-static inline int known_interior(double cr, double ci) {
-    double yy = ci * ci, x = cr - 0.25, q = x * x + yy;
-    double lhs = q * (q + x), rhs = 0.25 * yy;
-    if (lhs < rhs - 1e-14) return 1;
-    x = cr + 1.0;
-    return x * x + yy < 0.0625 - 1e-14;
+typedef struct { double lo, hi; } AnalyticInterval;
+/* Adjacent IEEE doubles give outward bounds without changing the rounding
+ * mode or importing nextafter into the WASM module. Callers use finite values. */
+static inline double analytic_down(double value) {
+    if (!value) return -0x1p-1074;
+    union { double f; uint64_t u; } bits = {.f=value};
+    if (value > 0) --bits.u; else ++bits.u;
+    return bits.f;
+}
+static inline double analytic_up(double value) {
+    if (value==__builtin_inf()) return value;
+    if (!value) return 0x1p-1074;
+    union { double f; uint64_t u; } bits = {.f=value};
+    if (value > 0) ++bits.u; else --bits.u;
+    return bits.f;
+}
+static inline double analytic_abs(double value) { return value < 0 ? -value : value; }
+static inline double analytic_coordinate_error(double value, double centre) {
+    double magnitude = analytic_up(analytic_abs(value) + analytic_abs(centre));
+    return analytic_up(analytic_up(magnitude * 0x1p-49) + 0x1p-1070);
+}
+static inline AnalyticInterval analytic_shift(AnalyticInterval a, double b) {
+    return (AnalyticInterval){analytic_down(a.lo+b),analytic_up(a.hi+b)};
+}
+static inline AnalyticInterval analytic_square(AnalyticInterval a) {
+    double left=a.lo*a.lo,right=a.hi*a.hi;
+    double hi=analytic_up(left>right?left:right);
+    double lo=a.lo<=0 && a.hi>=0?0:analytic_down(left<right?left:right);
+    return (AnalyticInterval){lo<0?0:lo,hi};
+}
+/* Certify the entire coordinate interval, not merely its rounded midpoint.
+ * Let u=2^-53 and eta=2^-1074. The three-limb deep-centre conversion has error
+ * <=4u|a|+eta in the stored centre a. The pixel offset d has error
+ * <=2u|d|+2eta, and the final sum s has error <=u(|a|+|d|)+eta.
+ * Since |d|<=2(|a|+|s|+eta), their sum is bounded by
+ * 11u|a|+6u|s|+(4+6u)eta < 16u(|a|+|s|)+16eta.
+ * Shallow coordinates have fewer rounding steps and obey the same bound.
+ * Every subsequent arithmetic operation is enclosed by adjacent doubles.
+ * Strict inequalities leave any unproved boundary point in the orbit path. */
+static int certified_interior(double cr, double ci) {
+    if (!__builtin_isfinite(cr) || !__builtin_isfinite(ci) ||
+        !__builtin_isfinite(centre_real) || !__builtin_isfinite(centre_imag)) return 0;
+    double er=analytic_coordinate_error(cr,centre_real),ei=analytic_coordinate_error(ci,centre_imag);
+    /* Very large cancellation is outside this bounded, overflow-free proof. */
+    if (!(er<1 && ei<1)) return 0;
+    AnalyticInterval real={analytic_down(cr-er),analytic_up(cr+er)};
+    AnalyticInterval imag={analytic_down(ci-ei),analytic_up(ci+ei)};
+    AnalyticInterval yy=analytic_square(imag);
+    /* The disk |c+1/4|<1/2 lies inside the main cardioid. It must enclose
+       the full uncertainty interval just like the polynomial test below. */
+    if (real.lo>-0.75 && real.hi<0.25) {
+        AnalyticInterval disk=analytic_square(analytic_shift(real,0.25));
+        if (analytic_up(disk.hi+yy.hi)<0.25) return 1;
+    }
+    AnalyticInterval x=analytic_shift(real,-0.25),xx=analytic_square(x);
+    AnalyticInterval q={analytic_down(xx.lo+yy.lo),analytic_up(xx.hi+yy.hi)};
+    if (q.lo<0) q.lo=0;
+    double sum_hi=analytic_up(q.hi+x.hi);
+    /* q>=0; when q+x is negative its upper product uses q's LOWER bound. */
+    double lhs_hi=analytic_up((sum_hi<0?q.lo:q.hi)*sum_hi);
+    double rhs_lo=analytic_down(0.25*yy.lo);
+    if (lhs_hi<rhs_lo) return 1;
+    if (real.lo>-1.25 && real.hi<-0.75) {
+        AnalyticInterval bulb=analytic_square(analytic_shift(real,1));
+        if (analytic_up(bulb.hi+yy.hi)<0.0625) return 1;
+    }
+    return 0;
+}
+
+static inline __attribute__((always_inline)) int known_interior(double cr, double ci) {
+    if (cr<-1.25 || cr>0.375 || analytic_abs(ci)>0.65) return 0;
+    /* Cheap certificates for ordinary views, with a proved coarse margin.
+     * If |centre|<=2, each coordinate error above is <64u. On the slightly
+     * enlarged rectangle, the cardioid polynomial's derivative magnitudes
+     * are <24 in cr and <10 in ci. Its rounded evaluation, including the
+     * threshold comparison, adds <256u. Total error is therefore <2432u,
+     * less than 8192u=2^-40. For either disk the derivative sum is <5 and
+     * evaluation error <256u, giving the still smaller bound <576u.
+     * Ambiguous points retain the full interval proof; no guessed epsilon
+     * is used to decide points near the cusp or either analytic boundary. */
+    if (analytic_abs(centre_real)<=2 && analytic_abs(centre_imag)<=2) {
+        const double margin=0x1p-40;
+        double yy=ci*ci,x=cr-0.25,q=x*x+yy;
+        if (q+cr<0.25-margin) return 1;
+        double lhs=q*(q+x),rhs=0.25*yy;
+        if (lhs<rhs-margin) return 1;
+        x=cr+1;
+        double bulb=x*x+yy;
+        if (bulb<0.0625-margin) return 1;
+        if (lhs>rhs+margin && bulb>0.0625+margin) return 0;
+    }
+    return certified_interior(cr,ci);
 }
 
 static inline uint32_t colour(unsigned n, double magnitude) {

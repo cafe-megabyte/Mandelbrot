@@ -1,0 +1,280 @@
+<!doctype html><meta charset="utf-8"><title>Mandelbrot performance comparison</title>
+<style>body{font:14px system-ui;background:#16181d;color:white;margin:20px}pre{white-space:pre-wrap}.host{position:relative;overflow:hidden;background:black}.frame{position:absolute;inset:0;overflow:hidden}canvas{position:absolute;display:block}a{color:#b4ffff}</style>
+<h1>Mandelbrot performance comparison</h1><p id="save-status"></p><a id="download" hidden>Download JSON report</a><pre id="report">Starting…</pre><div id="hosts"></div>
+<script type="module">
+const params=new URLSearchParams(location.search),mode=params.get('mode')||'survey';
+const output=document.getElementById('report'),records=[];
+const show=()=>{output.textContent=JSON.stringify(records,null,2);};
+const log=value=>{records.push(value);show();};
+const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const median=values=>{
+ if(!values.length)return null;
+ const sorted=[...values].sort((a,b)=>a-b),middle=Math.floor(sorted.length/2);
+ return sorted.length%2?sorted[middle]:(sorted[middle-1]+sorted[middle])/2;
+};
+const errorInfo=error=>({name:error?.name||'Error',message:error?.message||String(error),stack:error?.stack||null});
+// Serve the build directory at the origin root. The untouched baseline is a
+// saved build/web snapshot at internal/performance/before/site (with release.txt
+// and its immutable releases/ subtree); the candidate is the current build/web.
+// Direct release imports isolate rendering from Service Worker installation and
+// offline-package verification. These timings therefore do not measure startup.
+const baseline='/internal/performance/before/site';
+let oldRelease=null,nextRelease=null,createView,writeCentre;
+const paths={};
+const frameMode=mode==='frames'||mode==='frames-single';
+const singleVariant=params.get('variant')||'after';
+const rendererOptions={preview:params.get('preview')!=='0',adaptiveTiles:params.get('adaptive')!=='0',
+ pipeline:params.get('pipeline')!=='0',willReadFrequently:params.get('readback')==='1'};
+if(params.has('flags')&&mode!=='ablation')rendererOptions.engineOptions=Number(params.get('flags'));
+if(params.has('compact'))rendererOptions.compactTiles=params.get('compact')==='1';
+const method={
+ kernel:'Tile computation plus output-buffer allocation and WASM-to-JavaScript pixel copies. Configuration/reference preparation is measured separately; comparison is outside the timed region.',
+ frame:'Scheduler-start to completed frame, including worker computation, reference work, transfers, pixel copies and Canvas writes; preview work is included when enabled. Excludes subsequent PNG preparation and compositor presentation.',
+ requestToExport:'Request to decoded export image, including scheduling, computation, all transfer/copy work, Canvas readback, PNG encoding and decoding. Excludes compositor presentation.',
+ coldRuns:'First request for each fixture after renderer initialization, retained separately from warm medians. This is not process startup and does not force a cache flush; cache-hit fields identify reuse when available.',
+ milestones:'Preview/frame/optional first-tile event receipt is timed from the request without pixel reads or polling. frame.firstTileMilliseconds measures render-start to the first tile; no request-to-first-tile estimate is substituted when the event is unavailable.',
+ memory:mode==='frames-single'?'One renderer instance is created for this run. Use a fresh browser process or equivalent external baseline for process-RSS comparison; explicit buffer counters are not process peak memory.':
+  'Paired frame runs retain both renderer instances. Their combined process RSS is not an isolated per-variant memory measurement; use mode=frames-single&variant=before or after for separate runs.'
+};
+async function checkedFetch(url,options){
+ const response=await fetch(url,options);
+ if(!response.ok)throw Error(`HTTP ${response.status} for ${url}`);
+ return response;
+}
+async function initialize(){
+ if(!['survey','kernel','compare','ablation','frames','frames-single'].includes(mode))throw Error(`Unknown benchmark mode: ${mode}`);
+ if(mode==='frames-single'&&!['before','after'].includes(singleVariant))throw Error('variant must be before or after');
+ if(!selected.length)throw Error('No matching fixtures');
+ const required=mode==='frames-single'?[singleVariant]:mode==='survey'?['before']:['before','after'];
+ for(const name of required){
+  const root=name==='before'?baseline:'/web';
+  const release=(await(await checkedFetch(root+'/release.txt')).text()).trim();
+  if(!/^[a-f0-9-]{36}$/.test(release))throw Error(`Invalid ${name} release`);
+  paths[name]=`${root}/releases/${release}`;
+  if(name==='before')oldRelease=release;else nextRelease=release;
+ }
+ if(!frameMode)({createView,writeCentre}=await import(paths.before+'/view.js'));
+}
+const fixtures=[
+ {name:'overview',real:'-0.75',imag:'0',zoom:0,width:3840,height:2160},
+ {name:'overview-8k',real:'-0.75',imag:'0',zoom:0,width:7680,height:4320},
+ {name:'cusp-18',real:'0.25',imag:'0',zoom:18,width:1024,height:768},
+ {name:'interior-40',real:'0',imag:'0',zoom:40,width:1024,height:768},
+ {name:'seahorse-10',real:'-0.743643887037151',imag:'0.13182590420533',zoom:10,width:1920,height:1080},
+ {name:'seahorse-24',real:'-0.743643887037151',imag:'0.13182590420533',zoom:24,width:256,height:128},
+ {name:'preperiodic-40',real:'0',imag:'1',zoom:40,width:1024,height:768},
+ {name:'preperiodic-400',real:'0',imag:'1',zoom:400,width:512,height:320},
+ {name:'boundary-400',real:'-2',imag:'0',zoom:400,width:257,height:129},
+ {name:'preperiodic-1600',real:'0',imag:'1',zoom:1600,width:33,height:17}
+];
+const selected=fixtures.filter(f=>!params.get('only')||params.get('only').split(',').includes(f.name));
+function configure(e,view,w,h){
+ if(!view.deep){if(!e.configure_view(w,h,view.centreReal,view.centreImag,view.mantissa*2**view.exponent,view.iterations))throw Error('Invalid shallow configuration');return;}
+ let bits=Math.max(view.bits,Math.ceil((-2*view.exponent+192)/32)*32);
+ for(;;){
+  if(!e.deep_allocate(bits,view.iterations))throw Error('Allocation');writeCentre(e,view);
+  if(view.perturb){e.deep_begin(BigInt(view.real)<0n?-1:1,BigInt(view.imag)<0n?-1:1,view.mantissa,view.exponent,w,h);while(!e.deep_reference(128)){}if(e.deep_needs_precision()){bits+=64;continue;}e.deep_finish();}
+  if(!e.deep_configure(w,h,view.mantissa,view.exponent,view.iterations,BigInt(view.real)<0n?-1:1,BigInt(view.imag)<0n?-1:1))throw Error('Invalid deep configuration');
+  return;
+ }
+}
+function comparePixels(before,after){
+ if(before.length!==after.length)throw Error('Pixel buffer dimensions differ');
+ let differentPixels=0,maxChannelDifference=0,membershipDifferences=0,alphaDifferences=0;
+ for(let p=0;p<before.length;p+=4){
+  let differs=false;
+  for(let c=0;c<3;c++){const difference=Math.abs(before[p+c]-after[p+c]);if(difference)differs=true;maxChannelDifference=Math.max(maxChannelDifference,difference);}
+  if(before[p+3]!==after[p+3]){++alphaDifferences;differs=true;}
+  if(differs)++differentPixels;
+  if((!before[p]&&!before[p+1]&&!before[p+2])!==(!after[p]&&!after[p+1]&&!after[p+2]))++membershipDifferences;
+ }
+ return {pixelsCompared:before.length/4,differentPixels,maxChannelDifference,membershipDifferences,alphaDifferences};
+}
+function requireEqual(comparison,deep,label){
+ const tolerance=deep?1:0;
+ if(comparison.membershipDifferences||comparison.alphaDifferences||comparison.maxChannelDifference>tolerance)
+  throw Error(`Pixel regression ${label}: ${JSON.stringify(comparison)}; RGB tolerance ${tolerance}, exact membership and alpha required`);
+}
+async function kernel(){
+ const variants=mode==='survey'?['before']:mode==='ablation'?['before',...(params.get('flags')||'0,11,15,27,43,139,255').split(',').map(n=>'flags'+n)]:['before','after'];
+ const engines={};
+ for(const name of variants){
+  const bytes=await(await checkedFetch(paths[name==='before'?'before':'after']+'/engine-simd.wasm')).arrayBuffer();
+  engines[name]=(await WebAssembly.instantiate(bytes,{})).instance.exports;
+  if(name.startsWith('flags'))engines[name].deep_set_options(+name.slice(5));
+  else if(name==='after'&&params.has('flags'))engines[name].deep_set_options(+params.get('flags'));
+ }
+ for(const f of selected){
+  const w=f.name==='preperiodic-1600'?33:129,h=f.name==='preperiodic-1600'?17:65,v=createView();v.set(f);
+  const view=v.snapshot(f.width,f.height);if(f.zoom>=400)view.iterations=Math.min(view.iterations,4096);
+  const tx=Math.floor((f.width-w)/2),ty=Math.floor((f.height-h)/2);
+  const times={},setup={},pixels={},coldTimes={},comparisons={};
+  const record={fixture:f.name,mode,status:'running',timedRegion:'tile-compute-allocation-and-output-copies',width:w,height:h,
+   frameWidth:f.width,frameHeight:f.height,tileX:tx,tileY:ty,zoom:f.zoom,iterations:view.iterations,deep:view.deep,
+   flags:params.get('flags'),setup,coldTimes,times,comparisons};
+  log(record);
+  try{
+   for(const name of variants){const started=performance.now();configure(engines[name],view,f.width,f.height);setup[name]=performance.now()-started;times[name]=[];}
+   const rounds=mode==='survey'?1:7;
+   for(let repeat=0;repeat<rounds;repeat++){
+    for(const name of repeat%2?[...variants].reverse():variants){
+     await delay(0);const e=engines[name],started=performance.now(),image=new Uint8Array(w*h*4);
+     for(let y=0;y<h;y+=64){
+      const rows=Math.min(64,h-y);
+      if(!(view.deep?e.deep_render_tile(tx,ty+y,w,rows):e.render_tile(tx,ty+y,w,rows)))throw Error(`Unsettled ${f.name}`);
+      image.set(new Uint8Array(e.memory.buffer,e.output_address(),w*rows*4),y*w*4);
+     }
+     const elapsed=performance.now()-started;
+     if(!repeat)coldTimes[name]=elapsed;
+     if(mode==='survey'||repeat>=2)times[name].push(elapsed);
+     pixels[name]=image;
+    }
+    // Validate every round after its timings, including cold/warm-up rounds.
+    for(const name of variants.filter(n=>n!=='before')){
+     comparisons[name]=comparePixels(pixels.before,pixels[name]);
+     requireEqual(comparisons[name],view.deep,`${f.name}/${name}/round ${repeat}`);
+    }
+   }
+   record.medians=Object.fromEntries(variants.map(name=>[name,median(times[name])]));record.status='complete';show();
+  }catch(error){record.status='failed';record.error=errorInfo(error);throw error;}
+ }
+}
+async function frameBenchmark(){
+ const samples=Number(params.get('samples')||5);
+ if(!Number.isSafeInteger(samples)||samples<1)throw Error('samples must be a positive integer');
+ const variants=mode==='frames-single'?[singleVariant]:['before','after'],entries={};
+ try{
+  for(const name of variants){
+   const host=document.createElement('div');host.className='host';host.style.width='160px';host.style.height='100px';document.getElementById('hosts').append(host);
+   const entry={host,app:null,closed:false};entries[name]=entry;
+   const renderer=await import(paths[name]+'/app.js');history.replaceState(null,'',location.pathname+location.search);
+   let onReady,timer;
+   const ready=new Promise(resolve=>{onReady=resolve;host.addEventListener('mandelbrot-export',onReady,{once:true});});
+   const deadline=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error(`Renderer startup/export timeout: ${name}`)),60000);});
+   try{
+    const initialized=renderer.start(host,rendererOptions).then(app=>{
+     if(entry.closed){app.dispose();return;}
+     entry.app=app;return ready;
+    });
+    await Promise.race([initialized,deadline]);
+   }finally{clearTimeout(timer);host.removeEventListener('mandelbrot-export',onReady);}
+  }
+  async function capture(name,f){
+   const {host,app}=entries[name];
+   return new Promise((resolve,reject)=>{
+    const started=performance.now();let frame,preview,requestToFrameMilliseconds=null;
+    const firstTileEvents=[];
+    const timer=setTimeout(()=>{cleanup();reject(Error(`Frame timeout ${name} ${f.name}`));},240000);
+    const onFrame=event=>{
+     if(event.detail.phase==='final'&&event.detail.width===f.width&&event.detail.height===f.height){
+      requestToFrameMilliseconds=performance.now()-started;frame=event.detail;
+     }
+    };
+    const onPreview=event=>{preview={...event.detail,requestMilliseconds:performance.now()-started};};
+    const onFirstTile=event=>{firstTileEvents.push({...event.detail,requestMilliseconds:performance.now()-started});};
+    const onExport=event=>{
+     if(!frame||event.detail.width!==f.width||event.detail.height!==f.height)return;
+     const requestToExportMilliseconds=performance.now()-started;cleanup();
+     resolve({frame,preview,export:event.detail,requestToFrameMilliseconds,requestToExportMilliseconds,
+      firstTileMilliseconds:frame.firstTileMilliseconds??null,firstTileEvents,
+      requestToFirstTileMilliseconds:firstTileEvents[0]?.requestMilliseconds??null,
+      requestToPreviewMilliseconds:preview?.requestMilliseconds??null});
+    };
+    function cleanup(){
+     clearTimeout(timer);host.removeEventListener('mandelbrot-frame',onFrame);host.removeEventListener('mandelbrot-preview',onPreview);
+     host.removeEventListener('mandelbrot-first-tile',onFirstTile);host.removeEventListener('mandelbrot-export',onExport);
+    }
+    host.addEventListener('mandelbrot-frame',onFrame);host.addEventListener('mandelbrot-preview',onPreview);
+    host.addEventListener('mandelbrot-first-tile',onFirstTile);host.addEventListener('mandelbrot-export',onExport);
+    try{host.style.width=`${f.width/devicePixelRatio}px`;host.style.height=`${f.height/devicePixelRatio}px`;app.setView(f);}
+    catch(error){cleanup();reject(error);}
+   });
+  }
+  async function compareImages(f){
+   const images=variants.map(name=>entries[name].host.querySelector('img.export-image'));
+   if(images.some(image=>!image||image.naturalWidth!==f.width||image.naturalHeight!==f.height))throw Error('Export dimensions');
+   if(variants.length===1)return {performed:false,reason:'Single-variant isolation; run mode=frames for pixel comparison',dimensionsVerified:true};
+   const canvases=images.map(()=>document.createElement('canvas'));
+   const totals={performed:true,pixelsCompared:0,differentPixels:0,maxChannelDifference:0,membershipDifferences:0,alphaDifferences:0};
+   try{
+    for(let y=0;y<f.height;y+=512)for(let x=0;x<f.width;x+=512){
+     const w=Math.min(512,f.width-x),h=Math.min(512,f.height-y);
+     const arrays=canvases.map((canvas,i)=>{canvas.width=w;canvas.height=h;const context=canvas.getContext('2d',{willReadFrequently:true});context.drawImage(images[i],x,y,w,h,0,0,w,h);return context.getImageData(0,0,w,h).data;});
+     const comparison=comparePixels(arrays[0],arrays[1]);
+     for(const name of ['pixelsCompared','differentPixels','membershipDifferences','alphaDifferences'])totals[name]+=comparison[name];
+     totals.maxChannelDifference=Math.max(totals.maxChannelDifference,comparison.maxChannelDifference);
+    }
+   }finally{for(const canvas of canvases)canvas.width=0;}
+   return totals;
+  }
+  for(const f of selected){
+   if(f.name==='preperiodic-1600'){
+    log({fixture:f.name,mode,status:'skipped',reason:'Full production iteration budget is tested separately; the kernel fixture explicitly caps it at 4096.'});continue;
+   }
+   const runs=Object.fromEntries(variants.map(name=>[name,[]])),coldRuns={};
+   const record={fixture:f.name,mode,status:'running',variants,width:f.width,height:f.height,zoom:f.zoom,samples,
+    rendererOptions,concurrentRendererInstances:variants.length,coldRuns,runs};
+   log(record);
+   try{
+    for(let repeat=0;repeat<=samples;repeat++)for(const name of repeat%2?[...variants].reverse():variants){
+     const result=await capture(name,f);if(repeat)runs[name].push(result);else coldRuns[name]=result;await delay(10);
+    }
+    record.summary={};
+    for(const name of variants){
+     const availableMedian=field=>median(runs[name].map(run=>run[field]).filter(value=>Number.isFinite(value)));
+     record.summary[name]={frameMilliseconds:median(runs[name].map(run=>run.frame.milliseconds)),
+      requestToFrameMilliseconds:availableMedian('requestToFrameMilliseconds'),requestToExportMilliseconds:availableMedian('requestToExportMilliseconds'),
+      firstTileMilliseconds:availableMedian('firstTileMilliseconds'),requestToFirstTileMilliseconds:availableMedian('requestToFirstTileMilliseconds'),
+      requestToPreviewMilliseconds:availableMedian('requestToPreviewMilliseconds'),exportBytes:runs[name][0].export.bytes};
+    }
+    record.comparison=await compareImages(f);
+    if(record.comparison.performed)requireEqual(record.comparison,runs.before[0].frame.deep,f.name);
+    record.status='complete';show();
+   }catch(error){record.status='failed';record.error=errorInfo(error);throw error;}
+  }
+ }finally{
+  for(const entry of Object.values(entries)){entry.closed=true;entry.app?.dispose();entry.host.remove();}
+ }
+}
+async function saveReport(result){
+ const name=(params.get('name')||mode).replace(/[^a-zA-Z0-9._-]/g,'_')||'benchmark';
+ const link=document.getElementById('download'),status=document.getElementById('save-status');
+ let downloadURL;
+ function prepareDownload(){
+  if(downloadURL)URL.revokeObjectURL(downloadURL);
+  downloadURL=URL.createObjectURL(new Blob([JSON.stringify(result,null,2)],{type:'application/json'}));
+  link.href=downloadURL;link.download=name+'.json';link.hidden=false;
+ }
+ // A downloadable report exists even if the server cannot accept POST.
+ prepareDownload();
+ const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),10000);
+ try{
+  await checkedFetch('/results/'+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},
+   body:JSON.stringify(result),signal:controller.signal});
+  status.textContent='JSON report saved to the results server; a download is also available.';
+  document.body.dataset.saveState='saved';return true;
+ }catch(error){
+  result.storageError=errorInfo(error);prepareDownload();
+  status.textContent=`Server save failed (${error.message}). Use Download JSON report; the report includes any test failure.`;
+  document.body.dataset.saveState='download';return false;
+ }finally{clearTimeout(timer);}
+}
+let status='complete',failure=null;
+document.body.dataset.state='running';
+try{
+ output.textContent='Running '+mode;
+ await initialize();
+ if(frameMode)await frameBenchmark();else await kernel();
+}catch(error){status='failed';failure=errorInfo(error);log({status:'failed',error:failure});}
+const result={schemaVersion:1,date:new Date().toISOString(),status,error:failure,mode,userAgent:navigator.userAgent,
+ dpr:devicePixelRatio,hardwareConcurrency:navigator.hardwareConcurrency,beforeRelease:oldRelease,afterRelease:nextRelease,
+ parameters:Object.fromEntries(params),rendererOptions:frameMode?rendererOptions:null,method,records};
+try{
+ const saved=await saveReport(result);
+ document.body.dataset.state=status==='failed'?'failed':saved?'complete':'complete-download';
+ output.textContent+=status==='failed'?'\nFAILED — see the JSON report':saved?'\nCOMPLETE':'\nMEASUREMENTS COMPLETE — download the JSON report';
+}catch(error){
+ // Report-generation errors must remain visible even if Blob/URL creation fails.
+ document.body.dataset.state='failed';output.textContent+=`\nREPORT SAVE FAILED: ${error.stack||error}`;
+}
+</script>
