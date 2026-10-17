@@ -1,15 +1,30 @@
 # Development notes
 
-Updated 16 October 2026. Keep this file brief; generated reports belong in
+Updated 17 October 2026. Keep this file brief; generated reports belong in
 `build/internal/`, not in `docs/`.
 
 ## Current state
 
 - f64/ReferenceContext experiment fully removed after confirmed regressions;
   no fixture exceptions. Production option mask: **3851**.
-- Original core, render worker and build/check entry points restored.
-  SIMD WASM byte-identical to the original baseline; see [4K references](baseline-4k.md).
-- Rollback: `make check` passed; Boundary80/100/400 image hashes matched.
+- Adaptive navigation preview: WebGPU/WGSL when f32 coordinates suffice;
+  bounded WASM fallback while navigating. CPU cancellation is cooperative, with
+  a hard timeout; the original compiled module is shared. Final rendering has priority.
+- Accurate tiles appear in batches (125–500 ms). A buffered display replaces
+  the initial SVG-clip experiment, which caused repeatable browser regressions.
+  Owned dirty tile bytes use a bounded 8 MiB pool; display canvases and the pool
+  are released on completion. Accurate staging uses CPU-backed canvases;
+  overflow reads only dirty regions. Cold local-reference frames begin with small final
+  tiles to avoid long initial calls before WASM tier-up. Prepared global references
+  keep normal batches: tiny startup tiles caused a small throughput regression.
+  Views wholly within
+  conservative interior disks keep normal tiles and defer display copies;
+  every final pixel is still computed by the original WASM core. A stationary
+  shallow selection starts once its exact observed raster is available,
+  without another display-cycle delay; active gestures keep their hold.
+- The numerical core remains the original baseline. An exact-centre experiment
+  was reverted: it exposed broader existing coordinate/colour issues.
+  Numerical repairs require separate scope.
 - Progress pill: actual completed physical pixels, including mirrored rows;
   500 ms delay; tabular figures and stable widths; centred bullet;
   English default (commas), German primary browser language (dots).
@@ -49,6 +64,10 @@ Updated 16 October 2026. Keep this file brief; generated reports belong in
 - Do not copy Fraktaler code into this project without a license review.
 - Full comparisons freeze WASM, workers, view conversion and scheduler together;
   kernel-only measurements are not browser latency. Budget: at most 16 MiB extra per worker.
+- Progressive display temporarily adds up to four bytes per frame pixel
+  (about 32 MiB at 4K, 127 MiB at 8K) plus the bounded tile pool, outside worker memory. Fast frames may
+  finish before any display buffers are allocated. Benchmark GPU/compositor
+  work with the target raster fully inside the browser viewport.
 
 ## Documentation policy
 

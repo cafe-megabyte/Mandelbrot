@@ -304,7 +304,7 @@ document.getElementById('slow-test').onclick=async()=>{
       postMessage(message,...args){if(message.type==='render')this.job=message;this.worker.postMessage(message,...args);}
       terminate(){this.worker.terminate();}
     };
-    app=await renderer.start(host);
+    app=await renderer.start(host,{preview:false});
     await until(()=>host.dataset.state==='rendering');
     await delay(100);
     assert(host.querySelector('.frame').style.visibility==='hidden'&&!bar(),'Slow frame or progress appeared before threshold');
@@ -317,7 +317,7 @@ document.getElementById('slow-test').onclick=async()=>{
     const thousands=pill.lang==='de'?'.':',';
     assert(count.textContent==='0'&&host.querySelector('.render-progress-total').textContent===`66${thousands}177`,
       'Progress label does not show the physical pixel total');
-    assert(host.querySelector('.frame').style.visibility==='visible','Slow initial frame was not revealed');
+    assert(host.querySelector('.frame').style.visibility==='hidden','An empty frame replaced the background before any results');
     assert(bar().getAttribute('aria-valuenow')==='0','Progress advanced without completed pixels');
     await delay(100);
     assert(bar().getAttribute('aria-valuenow')==='0','Progress advanced with time alone');
@@ -392,7 +392,7 @@ document.getElementById('adaptive-resize').onclick=async()=>{
     host.style.width='64px';host.style.height='48px';
     host.addEventListener('mandelbrot-frame',onFrame);host.addEventListener('mandelbrot-resize',onMode);
     window.Worker=class{
-      constructor(...args){this.worker=new RealWorker(...args);this.timers=new Set();}
+      constructor(...args){this.worker=new RealWorker(...args);this.timers=new Set();this.preview=String(args[0]).includes('preview-worker');}
       set onmessage(fn){this.worker.onmessage=event=>{
         if(event.data.type!=='tile'||!slow){fn(event);return;}
         const timer=setTimeout(()=>{this.timers.delete(timer);fn(event);},80);this.timers.add(timer);
@@ -400,7 +400,7 @@ document.getElementById('adaptive-resize').onclick=async()=>{
       set onerror(fn){this.worker.onerror=fn;}
       set onmessageerror(fn){this.worker.onmessageerror=fn;}
       postMessage(message,...args){
-        if(message.type==='render')jobs.push({generation:message.generation,phase:host.dataset.phase,bufferBytes:message.buffer?.byteLength});
+        if(message.type==='render'&&!this.preview)jobs.push({generation:message.generation,phase:host.dataset.phase,bufferBytes:message.buffer?.byteLength});
         this.worker.postMessage(message,...args);
       }
       terminate(){for(const timer of this.timers)clearTimeout(timer);this.worker.terminate();}
@@ -414,17 +414,23 @@ document.getElementById('adaptive-resize').onclick=async()=>{
     log({test:'fast live resize',completedLiveFrames:live.length,maxMilliseconds:Math.max(...live.map(value=>value.milliseconds))});
     const before=jobs.length,completeCount=frames.length;
     slow=true;
+    let deferred=false;
     for(let i=0;i<6;++i){
       host.style.width=`${90+i}px`;host.style.height=`${70+i}px`;await delay(40);
-      if(i>=1)assert(host.dataset.resizeMode==='deferred','Slow gesture did not remain deferred');
+      // The first attempt starts after ResizeObserver/rAF. Once its deadline
+      // actually pauses the gesture, later inputs must keep that pause.
+      const paused=host.dataset.resizeMode==='deferred';
+      if(deferred)assert(paused,'Slow gesture did not remain deferred');
+      deferred ||= paused;
     }
+    assert(deferred,'Slow gesture never entered deferred mode');
     const liveJobs=new Set(jobs.slice(before).filter(value=>value.phase==='live').map(value=>value.generation));
-    assert(liveJobs.size===1,'Slow gesture restarted live calculations');
+    assert(liveJobs.size===1,'Slow gesture restarted live calculations: '+JSON.stringify({jobs:jobs.slice(before),modes}));
     assert(frames.length===completeCount,'Slow live frame was displayed');
-    assert(host.querySelector('.frame').style.visibility==='visible','Last complete image disappeared');
+    assert(getComputedStyle(host.querySelector('.frame')).visibility==='visible','Last complete image disappeared');
     await settled();
     const final=frames[frames.length-1],dpr=devicePixelRatio||1;
-    assert(final.phase==='final'&&final.width===95*dpr&&final.height===75*dpr,'Settled frame used an outdated size');
+    assert(final.phase==='final'&&final.width===Math.round(95*dpr)&&final.height===Math.round(75*dpr),'Settled frame used an outdated size');
     assert(jobs.slice(before).filter(value=>value.phase==='final').every(value=>value.bufferBytes===65536),'Canceled tile buffers were not recycled');
     await verify(host);
     assert(modes.some(value=>value.mode==='deferred'&&value.reason==='deadline'),'Deadline did not trigger the pause');

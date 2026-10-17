@@ -1,0 +1,294 @@
+<!doctype html><meta charset="utf-8"><title>Mandelbrot rendering checks</title>
+<style>
+body{font:13px system-ui;background:#17191f;color:#eee;margin:16px}pre{white-space:pre-wrap}
+.host{position:relative;overflow:hidden;background:#000}.frame{position:absolute;inset:0;overflow:hidden;background:#000}
+canvas{position:absolute;display:block}button{padding:8px;margin:0 8px 12px 0}
+.panel{position:relative;z-index:2;background:#17191fdd;max-width:600px;max-height:28vh;overflow:auto}
+#hosts .host{position:fixed;left:0;top:0}
+</style>
+<section class="panel">
+<h1>Mandelbrot rendering checks</h1>
+<button id="checks">Run rendering checks</button><button id="frames">Run all 25 reference pairs</button>
+<pre id="report">Ready</pre></section><div id="hosts"></div>
+<script type="module">
+const params=new URLSearchParams(location.search),report=document.getElementById('report'),records=[];
+let running=false;
+const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const assert=(value,message)=>{if(!value)throw Error(message);};
+const resultName=(params.get('name')||'rendering').replace(/[^a-zA-Z0-9_-]/g,'_');
+async function log(record) {
+  records.push(record);report.textContent=JSON.stringify(records,null,2);
+  try{await fetch('/__reports/'+resultName,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(records)});}catch{}
+}
+function eventOnce(host,type,predicate=()=>true,timeout=1800000) {
+  let listener,timer;
+  const promise=new Promise((resolve,reject)=>{
+    listener=event=>{if(predicate(event.detail)){cleanup();resolve(event.detail);}};
+    timer=setTimeout(()=>{cleanup();reject(Error('Timed out: '+type));},timeout);host.addEventListener(type,listener);
+  });
+  function cleanup(){clearTimeout(timer);host.removeEventListener(type,listener);}
+  return {promise,cleanup};
+}
+async function releaseURL(variant) {
+  if(variant==='after' && params.get('dev')==='1')return '/dev-site';
+  const root=variant==='before'?'/internal/performance/before/site':params.has('frozen')?'/internal/performance/after/site':'/web';
+  return root+'/releases/'+(await(await fetch(root+'/release.txt')).text()).trim();
+}
+async function instance(variant,options={}) {
+  const host=document.createElement('div');host.className='host';host.style.width='160px';host.style.height='100px';
+  document.getElementById('hosts').append(host);
+  history.replaceState(null,'',location.pathname+location.search);
+  const {start}=await import((await releaseURL(variant))+'/app.js');
+  // Normalize Chromium content-box reporting to the emulated viewport DPR
+  // so the complete physical raster is actually painted inside the viewport.
+  let rasterRatio=await new Promise(resolve=>{
+    const observer=new ResizeObserver(([entry])=>{observer.disconnect();
+      const box=entry.devicePixelContentBoxSize?.[0];resolve(box?box.inlineSize/host.getBoundingClientRect().width:devicePixelRatio);});
+    try{observer.observe(host,{box:'device-pixel-content-box'});}catch{observer.observe(host);}
+  });
+  if(Math.abs(rasterRatio-devicePixelRatio)>.01){
+    // Chromium's native content box can ignore viewport DPR emulation. Keep
+    // the observer consistent with that viewport, including actual 4K painting.
+    const NativeObserver=ResizeObserver;
+    window.ResizeObserver=class extends NativeObserver{
+      constructor(callback){super((entries,observer)=>callback(entries.map(entry=>new Proxy(entry,{get(target,key){
+        if(key==='devicePixelContentBoxSize'){const r=target.contentRect,dpr=devicePixelRatio||1;
+          return [{inlineSize:Math.round(r.width*dpr),blockSize:Math.round(r.height*dpr)}];}
+        return Reflect.get(target,key,target);
+      }})),observer));}
+    };
+    rasterRatio=devicePixelRatio;
+  }
+  const ready=eventOnce(host,'mandelbrot-export',d=>d.width===Math.round(160*rasterRatio));
+  let app,initial;
+  try{app=await start(host,options);initial=await ready.promise;}
+  catch(error){ready.cleanup();app?.dispose();host.remove();throw error;}
+  return {host,app,rasterRatio,close(){app.dispose();host.replaceChildren();host.remove();}};
+}
+async function capture(variant,fixture) {
+  const entry=await instance(variant,{gpuPreview:params.get('gpu')!=='0',progressive:params.get('progressive')!=='0',coldTiles:params.get('coldTiles')!=='0',
+    ...(variant==='after' && params.has('readFrequently')?{willReadFrequently:params.get('readFrequently')==='1'}:{})});
+  const {host,app}=entry,previews=[],presents=[];
+  await new Promise(requestAnimationFrame);
+  const started=performance.now();let frame,frameAt,selectedView;
+  const onFrame=event=>{if(event.detail.phase==='final'){frame=event.detail;frameAt=performance.now()-started;
+    selectedView=[...host.children].find(child=>child._frame)?._frame.view;}};
+  const onPreview=event=>previews.push({...event.detail,requestMilliseconds:performance.now()-started});
+  const onPresent=event=>presents.push({...event.detail,requestMilliseconds:performance.now()-started});
+  host.addEventListener('mandelbrot-frame',onFrame);host.addEventListener('mandelbrot-preview',onPreview);
+  host.addEventListener('mandelbrot-present',onPresent);
+  const exported=eventOnce(host,'mandelbrot-export',d=>d.width===fixture.width && d.height===fixture.height);
+  try {
+    host.style.width=fixture.width/entry.rasterRatio+'px';host.style.height=fixture.height/entry.rasterRatio+'px';app.setView(fixture);
+    assert(host.getBoundingClientRect().width<=innerWidth && host.getBoundingClientRect().height<=innerHeight,
+      'Reference raster must be fully inside the browser viewport');
+    const exportDetail=await exported.promise,exportAt=performance.now()-started;
+    assert(frame?.width===fixture.width && frame.height===fixture.height,'Incorrect final raster');
+    assert(frame.iterations===fixture.iterations,'Final iteration budget changed');
+    if(fixture.expectedRaster){const expected=fixture.expectedRaster,bytes=new DataView(new ArrayBuffer(8));
+      bytes.setFloat64(0,selectedView.mantissa);const mantissa=bytes.getBigUint64(0).toString(16).padStart(16,'0');
+      assert(selectedView.bits===expected.bits && selectedView.real===expected.real && selectedView.imag===expected.imag &&
+        selectedView.exponent===expected.exponent && mantissa===expected.mantissaBits,'Final coordinate grid changed');}
+    const blob=await(await fetch(host.querySelector('img.export-image').src)).blob();
+    return {blob,metrics:{frame,export:exportDetail,rasterRatio:entry.rasterRatio,
+      hostCSS:{width:host.getBoundingClientRect().width,height:host.getBoundingClientRect().height},
+      viewportCSS:{width:document.documentElement.clientWidth,height:document.documentElement.clientHeight},dpr:devicePixelRatio,
+      jsHeapBytes:performance.memory?.usedJSHeapSize,requestToFrameMilliseconds:frameAt,requestToExportMilliseconds:exportAt,
+      firstVisibleMilliseconds:Math.min(frameAt,presents[0]?.requestMilliseconds??Infinity,previews[0]?.requestMilliseconds??Infinity),
+      previews,presentCount:presents.length,firstPresent:presents[0],lastPresent:presents.at(-1)}};
+  } finally{exported.cleanup();entry.close();}
+}
+async function comparePNGs(a,b) {
+  const images=await Promise.all([createImageBitmap(a),createImageBitmap(b)]);
+  const canvas=document.createElement('canvas'),context=canvas.getContext('2d',{willReadFrequently:true});
+  let differentPixels=0,maxChannelDifference=0,membershipDifferences=0,alphaDifferences=0;
+  const samples=[],oracleSamples=[];
+  try {
+    assert(images[0].width===images[1].width && images[0].height===images[1].height,'PNG dimensions differ');
+    for(let y=0;y<images[0].height;y+=128)for(let x=0;x<images[0].width;x+=512) {
+      canvas.width=Math.min(512,images[0].width-x);canvas.height=Math.min(128,images[0].height-y);
+      const bytes=images.map(image=>{context.drawImage(image,x,y,canvas.width,canvas.height,0,0,canvas.width,canvas.height);
+        return context.getImageData(0,0,canvas.width,canvas.height).data;});
+      for(let i=0;i<bytes[0].length;i+=4) {
+        let differs=false,pixelDelta=0;
+        for(let c=0;c<3;c++){const delta=Math.abs(bytes[0][i+c]-bytes[1][i+c]);maxChannelDifference=Math.max(maxChannelDifference,delta);pixelDelta=Math.max(pixelDelta,delta);differs ||= delta>0;}
+        if(differs){++differentPixels;if(samples.length<32)samples.push({x:x+(i/4)%canvas.width,
+          y:y+Math.floor((i/4)/canvas.width),before:[...bytes[0].subarray(i,i+4)],after:[...bytes[1].subarray(i,i+4)]});}
+        if(bytes[0][i+3]!==bytes[1][i+3])++alphaDifferences;
+        if((!bytes[0][i]&&!bytes[0][i+1]&&!bytes[0][i+2])!==(!bytes[1][i]&&!bytes[1][i+1]&&!bytes[1][i+2]))++membershipDifferences;
+        if(pixelDelta>1 && oracleSamples.length<256)oracleSamples.push({x:x+(i/4)%canvas.width,
+          y:y+Math.floor((i/4)/canvas.width),before:[...bytes[0].subarray(i,i+4)],after:[...bytes[1].subarray(i,i+4)]});
+      }
+    }
+  } finally{images.forEach(image=>image.close());canvas.width=0;}
+  return {differentPixels,maxChannelDifference,membershipDifferences,alphaDifferences,samples,oracleSamples};
+}
+async function frames() {
+  const fixtures=(await(await fetch('/internal/tests/regions.json')).json()).fixtures
+    .filter(f=>!params.get('skip') || !params.get('skip').split(',').includes(f.id))
+    .filter(f=>!params.get('only') || params.get('only').split(',').includes(f.id));
+  const pairs=Number(params.get('pairs')||1);
+  assert(fixtures.length && Number.isSafeInteger(pairs) && pairs>0,'Invalid fixtures or pairs');
+  const hashes={};
+  for(const variant of ['before','after']) {
+    const base=await releaseURL(variant);hashes[variant]={};
+    for(const name of ['engine-simd.wasm','engine-worker.js','reference-worker.js','view.js','tile-queue.js','resize-scheduler.js']) {
+      const data=await(await fetch(base+'/'+name)).arrayBuffer();
+      hashes[variant][name]=[...new Uint8Array(await crypto.subtle.digest('SHA-256',data))].map(b=>b.toString(16).padStart(2,'0')).join('');
+    }
+  }
+  const numericalBackendIdentical=JSON.stringify(hashes.before)===JSON.stringify(hashes.after);
+  await log({status:'method',before:await releaseURL('before'),after:await releaseURL('after'),
+    width:document.documentElement.clientWidth,height:document.documentElement.clientHeight,dpr:devicePixelRatio,
+    numericalBackendIdentical,hashes,
+    method:'Separate renderer instances in alternating A/B order. Complete production budgets; preview, Canvas and PNG included. Warm startup overview; cold target frame per instance. Content-box reporting is normalized to the viewport DPR for fully visible physical rasters. Explicit memory counters are not process peak RSS.'});
+  for(let pair=0;pair<pairs;pair++)for(let index=0;index<fixtures.length;index++) {
+    const fixture=fixtures[index],order=(pair+index)%2?['after','before']:['before','after'],runs={};
+    for(const variant of order) {
+      await log({status:'running',fixture:fixture.id,pair:pair+1,variant});
+      runs[variant]=await capture(variant,fixture);
+      await log({status:'measured',fixture:fixture.id,pair:pair+1,variant,...runs[variant].metrics});
+    }
+    const comparison=await comparePNGs(runs.before.blob,runs.after.blob);
+    await log({status:'pixel-comparison',fixture:fixture.id,pair:pair+1,comparison});
+    assert(!comparison.alphaDifferences,'PNG alpha regression');
+    if(runs.after.metrics.frame.deep && comparison.maxChannelDifference>1) {
+      assert(numericalBackendIdentical || comparison.oracleSamples.length<256,'Too many differing pixels for individual interval verification');
+      const {createView}=await import((await releaseURL('after'))+'/view.js');
+      const {oraclePixel}=await import('/internal/tests/numerical-oracle.js');
+      const selection=createView();selection.set(fixture);const view=selection.snapshot(fixture.width,fixture.height);
+      const checkedSamples=numericalBackendIdentical?comparison.oracleSamples.slice(0,8):comparison.oracleSamples;
+      const verified=checkedSamples.map(sample=>{
+        let truth;
+        try{truth=oraclePixel(view,fixture.width,fixture.height,sample.x,sample.y,{verifyHigherPrecision:true,
+          ...(numericalBackendIdentical?{maximumBits:Math.max(view.bits+96,Math.ceil((-2*view.exponent+288)/32)*32)+512}:{})});}
+        catch(error){if(!numericalBackendIdentical)throw error;return {...sample,unresolved:String(error),candidateMatches:false};}
+        const candidateMatches=sample.after.every((value,c)=>Math.abs(value-truth.rgba[c])<=1);
+        assert(candidateMatches || numericalBackendIdentical,'Candidate fails independent pixel oracle: '+JSON.stringify({sample,truth}));
+        return {...sample,truth,candidateMatches};
+      });
+      await log({status:verified.every(pixel=>pixel.candidateMatches)?'oracle-verified':'baseline-numerical-limitation',
+        fixture:fixture.id,pair:pair+1,verified,numericalBackendIdentical,checkedPixels:verified.length,
+        note:numericalBackendIdentical?'Unchanged numerical backend; adaptive tile/reference state can expose existing numerical limitations. This is not a proof of mathematical correctness.':undefined});
+    } else assert(!comparison.membershipDifferences && comparison.maxChannelDifference<=(runs.after.metrics.frame.deep?1:0),
+      'PNG regression: '+JSON.stringify(comparison));
+    await log({status:'compared',fixture:fixture.id,pair:pair+1,comparison,
+      frameChangePercent:100*(runs.after.metrics.requestToFrameMilliseconds/runs.before.metrics.requestToFrameMilliseconds-1),
+      exportChangePercent:100*(runs.after.metrics.requestToExportMilliseconds/runs.before.metrics.requestToExportMilliseconds-1)});
+  }
+  await log({status:'passed',fixtures:fixtures.length,pairs});
+}
+async function checks() {
+  const base=await releaseURL('after');
+  const module=await WebAssembly.compile(await(await fetch(base+'/engine-simd.wasm')).arrayBuffer());
+  // Only the developer harness can destroy the native test device. The
+  // production message handler then exercises its ordinary lost-device path.
+  const workerSource=(await(await fetch(base+'/preview-worker.js')).text())
+    .replace("'./view.js'",JSON.stringify(new URL(base+'/view.js',location.href).href));
+  const probeURL=URL.createObjectURL(new Blob([workerSource,`
+    const productionMessage=self.onmessage;
+    self.onmessage=async event=>{
+      if(event.data.type==='test-device-loss'){
+        const target=device;target.destroy();await target.lost;
+        self.postMessage({type:'test-device-lost'});
+      }else await productionMessage(event);
+    };
+  `],{type:'text/javascript'}));
+  const probe=new Worker(probeURL,{type:'module'});
+  const gpu=await new Promise(resolve=>{probe.onmessage=({data})=>resolve(data);probe.postMessage({type:'init',module,gpu:true});});
+  await log({status:'gpu-probe',...gpu});
+  if(gpu.gpu) {
+    const {createView}=await import(base+'/view.js'),view=createView().snapshot(160,100);
+    const image=await new Promise(resolve=>{probe.onmessage=({data})=>resolve(data);probe.postMessage({type:'render',id:1,backend:'webgpu',width:160,height:100,view});});
+    assert(image.bitmap && image.backend==='webgpu','GPU shader did not produce a bitmap');
+    const canvas=new OffscreenCanvas(160,100),context=canvas.getContext('2d');context.drawImage(image.bitmap,0,0);image.bitmap.close();
+    assert(context.getImageData(0,0,160,100).data.some((v,i)=>i%4!==3 && v>0),'GPU shader produced an empty image');
+    await log({status:'gpu-shader-passed',milliseconds:image.milliseconds});
+    await new Promise(resolve=>{probe.onmessage=({data})=>{if(data.type==='test-device-lost')resolve();};probe.postMessage({type:'test-device-loss'});});
+    const lost=await new Promise(resolve=>{probe.onmessage=({data})=>resolve(data);probe.postMessage({type:'render',id:2,backend:'webgpu',width:160,height:100,view});});
+    assert(lost.type==='unavailable','Lost GPU device accepted more work');
+    const fallback=await new Promise(resolve=>{probe.onmessage=({data})=>resolve(data);probe.postMessage({type:'render',id:3,backend:'wasm',width:16,height:10,view});});
+    assert(fallback.bitmap && fallback.backend==='wasm','Native GPU loss broke the WASM fallback');fallback.bitmap.close();
+    await log({status:'native-gpu-loss-passed'});
+  }
+  probe.terminate();URL.revokeObjectURL(probeURL);
+  const entry=await instance('after',{gpuPreview:params.get('gpu')!=='0'}),{host,app}=entry;
+  try {
+    const previews=[],presents=[];
+    host.addEventListener('mandelbrot-preview',event=>previews.push(event.detail));
+    host.addEventListener('mandelbrot-present',event=>presents.push(event.detail));
+    const rect=host.getBoundingClientRect();
+    for(let n=0;n<12;n++) {
+      host.dispatchEvent(new WheelEvent('wheel',{deltaY:-60,clientX:rect.left+80,clientY:rect.top+50,cancelable:true,bubbles:true}));
+      await delay(40);
+    }
+    await delay(500);
+    assert(previews.some(p=>p.quality?.moving),'Live navigation never showed a preview');
+    if(params.get('gpu')==='0')assert(previews.every(p=>p.backend==='wasm'),'Disabled GPU still produced app previews');
+    await log({status:'live-preview-passed',gpu:!!navigator.gpu,backends:[...new Set(previews.map(p=>p.backend))],previews:previews.length});
+    host.style.width='1024px';host.style.height='512px';
+    const expectedWidth=Math.round(1024*entry.rasterRatio);
+    let sourcePixels;
+    const savePixels=event=>{
+      if(event.detail.width!==expectedWidth)return;
+      const frame=[...host.children].find(child=>child._frame)._frame;
+      sourcePixels=new Uint8ClampedArray(frame.width*frame.height*4);
+      for(const [key,{context}] of frame.surfaces){const [sx,sy]=key.split(',').map(Number),w=context.canvas.width,h=context.canvas.height;
+        const pixels=context.getImageData(0,0,w,h).data;
+        for(let row=0;row<h;row++)sourcePixels.set(pixels.subarray(row*w*4,(row+1)*w*4),((sy*1024+row)*frame.width+sx*1024)*4);}
+      host.removeEventListener('mandelbrot-frame',savePixels);
+    };
+    host.addEventListener('mandelbrot-frame',savePixels);
+    const partial=eventOnce(host,'mandelbrot-present',d=>!d.final),finished=eventOnce(host,'mandelbrot-export',d=>d.width===expectedWidth);
+    app.setView({real:'-0.743643887037151',imag:'0.13182590420533',zoom:18});
+    const first=await partial.promise;
+    assert(first.completedPixels<first.width*first.height,'Only the completed image was presented');
+    const layer=[...host.children].reverse().find(child=>child._frame)?._frame;
+    assert(layer?.shown && layer.completed<layer.total,'Partial image layer stayed hidden');
+    assert([...layer.surfaces.values()].some(s=>s.display && s.visibleRegions?.length),'Completed regions were not displayed');
+    for(const surface of layer.surfaces.values())if(surface.display){
+      for(const r of surface.visibleRegions){
+        const accurate=surface.context.getImageData(r.x,r.y,r.width,r.height).data;
+        const shown=surface.display.getImageData(r.x,r.y,r.width,r.height).data;
+        assert(shown.every((value,index)=>value===accurate[index]),'Presented tile bytes differ from accurate staging pixels');
+      }
+      const x=surface.display.canvas.width-1,y=surface.display.canvas.height-1;
+      if(!surface.visibleRegions.some(r=>x>=r.x&&x<r.x+r.width&&y>=r.y&&y<r.y+r.height))
+        assert(surface.display.getImageData(x,y,1,1).data[3]===0,'Unfinished display pixels cover the preview');
+    }
+    await log({status:'partial-visible',first});
+    await finished.promise;
+    assert(host.querySelector('img.export-image'),'Completed PNG missing');
+    const bitmap=await createImageBitmap(await(await fetch(host.querySelector('img.export-image').src)).blob());
+    const output=new OffscreenCanvas(bitmap.width,bitmap.height),context=output.getContext('2d');context.drawImage(bitmap,0,0);bitmap.close();
+    const exportedPixels=context.getImageData(0,0,output.width,output.height).data;
+    assert(sourcePixels && exportedPixels.every((value,index)=>value===sourcePixels[index]),'Final PNG differs from the accurate WASM staging pixels');
+    sourcePixels=null;
+    await log({status:'progressive-passed',updates:presents.length,firstMilliseconds:first.milliseconds,allPNGBytesMatchStaging:true});
+    // Supersede an already visible partial image; the next render must own all
+    // callbacks and bounded background resources.
+    const nextPartial=eventOnce(host,'mandelbrot-present',d=>!d.final);
+    app.setView({real:'-0.743643887037151',imag:'0.13182590420533',zoom:24});await nextPartial.promise;
+    const reset=eventOnce(host,'mandelbrot-export');app.reset();await reset.promise;
+    assert(host.querySelectorAll('.frame').length===1,'Canceled partial layers accumulated');
+    await log({status:'passed',checks:['live preview','buffered regions','full PNG','partial cancellation','bounded layers']});
+  } finally{entry.close();}
+}
+async function single() {
+  const fixture=(await(await fetch('/internal/tests/regions.json')).json()).fixtures.find(f=>f.id===params.get('fixture'));
+  const variant=params.get('variant');assert(fixture && ['before','after'].includes(variant),'Invalid single run');
+  await log({status:'running',fixture:fixture.id,variant,release:await releaseURL(variant)});
+  const result=await capture(variant,fixture);
+  await log({status:'measured',fixture:fixture.id,variant,...result.metrics});
+  const saved=await fetch('/__images/'+resultName,{method:'POST',body:result.blob});assert(saved.ok,'PNG artifact was not saved');
+  await log({status:'passed',fixture:fixture.id,variant,image:'/internal/performance/reports/'+resultName+'.png'});
+}
+async function run(mode) {
+  if(running)return;running=true;
+  try{await (mode==='frames'?frames():mode==='single'?single():checks());}
+  catch(error){await log({status:'failed',error:String(error.stack||error)});}
+  finally{running=false;}
+}
+document.getElementById('checks').onclick=()=>run('checks');document.getElementById('frames').onclick=()=>run('frames');
+if(params.has('mode'))run(params.get('mode'));
+</script>

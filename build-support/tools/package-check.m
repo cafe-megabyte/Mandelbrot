@@ -109,7 +109,7 @@ int main(int argc, const char **argv) {
             NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
             if (!attributes || ![attributes[NSFileType] isEqual:NSFileTypeRegular] || [attributes fileSize] != [item[@"size"] unsignedLongLongValue] || ![attributes fileSize]) return 1;
         }
-        for (NSString *name in @[@"index.html", @"app.js", @"resize-scheduler.js", @"image-export.js", @"png-worker.js", @"engine-worker.js", @"view.js", @"navigation.js", @"reference-worker.js", @"tile-queue.js", @"engine-scalar.wasm", @"engine-simd.wasm", @"XCC-LICENSE.txt",
+        for (NSString *name in @[@"index.html", @"app.js", @"presentation.js", @"preview.js", @"preview-worker.js", @"resize-scheduler.js", @"image-export.js", @"png-worker.js", @"engine-worker.js", @"view.js", @"navigation.js", @"reference-worker.js", @"tile-queue.js", @"engine-scalar.wasm", @"engine-simd.wasm", @"XCC-LICENSE.txt",
             @"site.webmanifest", @"favicon.ico", @"favicon-16.png", @"favicon-32.png", @"favicon-48.png",
             @"apple-touch-icon-152.png", @"apple-touch-icon-167.png", @"apple-touch-icon.png",
             @"icon-192.png", @"icon-512.png", @"icon-1024.png", @"icon-maskable-512.png", @"icon-maskable-1024.png"])

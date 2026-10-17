@@ -24,7 +24,9 @@ const paths={};
 const frameMode=mode==='frames'||mode==='frames-single';
 const singleVariant=params.get('variant')||'after';
 const rendererOptions={preview:params.get('preview')!=='0',adaptiveTiles:params.get('adaptive')!=='0',
- pipeline:params.get('pipeline')!=='0',willReadFrequently:params.get('readback')==='1'};
+ pipeline:params.get('pipeline')!=='0',
+ ...(params.has('readback')?{willReadFrequently:params.get('readback')==='1'}:{}),
+ gpuPreview:params.get('gpu')!=='0',progressive:params.get('progressive')!=='0'};
 if(params.has('flags')&&mode!=='ablation')rendererOptions.engineOptions=Number(params.get('flags'));
 if(params.has('compact'))rendererOptions.compactTiles=params.get('compact')==='1';
 const method={

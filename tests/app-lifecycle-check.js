@@ -2,9 +2,9 @@
 // No browser, sockets, image computation or wall-clock sleeps are needed.
 var testDone = false;
 const assertLifecycle = (condition, message) => { if (!condition) throw new Error(message); };
-async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = false,
-  compactTiles, engineOptions, minTilePixels, languages, language} = {}) {
-  let time = 0, sequence = 0;
+async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = false, progressive = true, imag = '1',
+  compactTiles, engineOptions, minTilePixels, coldTiles, languages, language} = {}) {
+  let time = 0, sequence = 0, navigate, resizeCallback;
   const timers = new Map(), workers = [], canvases = [], sentBuffers = new Set(), errors = [];
   const timer = (fn, delay = 0) => { const id = ++sequence; timers.set(id, {fn, at: time + delay}); return id; };
   const cancelTimer = id => timers.delete(id);
@@ -27,6 +27,7 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
       this.listeners = new Map(); this.attributes = new Map(); this.width = 0; this.height = 0;
     }
     append(...children) { for (const child of children) { child.remove(); this.children.push(child); child.parentNode = this; } }
+    insertBefore(child,before) {child.remove();this.children.splice(this.children.indexOf(before),0,child);child.parentNode=this;}
     remove() {
       if (this.parentNode) this.parentNode.children.splice(this.parentNode.children.indexOf(this), 1);
       this.parentNode = null;
@@ -43,7 +44,7 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
     get clientWidth() { return width; }
     get clientHeight() { return height; }
     getContext() {
-      if (!this.context) this.context = {canvas: this, writes: 0, putImageData: image => {
+      if (!this.context) this.context = {canvas: this, writes: 0, drawImage() {},getImageData(x,y,w,h){return {data:new Uint8ClampedArray(w*h*4)};}, transferFromImageBitmap(bitmap) {bitmap.close();}, putImageData: image => {
         assertLifecycle(!sentBuffers.has(image.data.buffer), 'Canvas used a buffer already transferred to a worker');
         assertLifecycle(this.width > 0, 'Canvas backing store was released before presentation');
         ++this.context.writes;
@@ -61,9 +62,10 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
   document.createElement = tag => {
     const element = new Element(tag); if (tag === 'canvas') canvases.push(element); return element;
   };
+  document.createElementNS = (namespace,tag) => document.createElement(tag);
   class Worker {
     constructor(url) {
-      this.kind = String(url).includes('reference-worker') ? 'reference' : 'engine';
+      this.kind = String(url).includes('reference-worker') ? 'reference' : String(url).includes('preview-worker') ? 'preview' : 'engine';
       this.messages = []; this.jobs = []; this.terminated = false; workers.push(this);
     }
     postMessage(message, transfers = []) {
@@ -73,6 +75,7 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
       }
       this.messages.push({...message});
       if (message.type === 'init' && this.kind === 'engine') timer(() => this.emit({type: 'ready'}), 0);
+      if (message.type === 'init' && this.kind === 'preview') timer(() => this.emit({type: 'ready',gpu:message.gpu}), 0);
       if (message.type === 'render') this.jobs.push({...message});
     }
     terminate() { this.terminated = true; }
@@ -82,6 +85,11 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
       assertLifecycle(request, 'Reference result has no request');
       this.emit({type: 'reference', generation: request.generation, bits: 1024, buffer: new ArrayBuffer(1024),
         referenceBytes: 1024, memoryBytes: 65536, milliseconds: 1, cacheHit: false});
+    }
+    preview() {
+      const job=this.jobs.shift();assertLifecycle(job,'Preview result has no request');
+      const bitmap={closed:false,close(){this.closed=true;}};
+      this.emit({...job,type:'preview',bitmap,iterations:job.view.iterations,milliseconds:1});return bitmap;
     }
     tile(stats = {retries: 0}, computeMilliseconds = 1) {
       const job = this.jobs.shift(); assertLifecycle(job, 'Tile result has no request');
@@ -103,24 +111,27 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
     document, window, location, history, console, navigator: {hardwareConcurrency: 2, languages, language}, devicePixelRatio: 1,
     Worker, URL, ImageData: class { constructor(data) { this.data = data; } },
     CustomEvent: class { constructor(type, properties) { this.type = type; Object.assign(this, properties); } },
-    ResizeObserver: class { observe() {} disconnect() {} },
+    ResizeObserver: class { constructor(callback){resizeCallback=callback;} observe() {} disconnect() {} },
     matchMedia: () => ({addEventListener() {}, removeEventListener() {}}),
     performance: {now: () => time}, setTimeout: timer, clearTimeout: cancelTimer,
     requestAnimationFrame: fn => timer(fn, 16), cancelAnimationFrame: cancelTimer,
     fetch: async () => ({ok: true, arrayBuffer: async () => new ArrayBuffer(8)}),
     WebAssembly: {validate: () => true, compile: async () => ({}), Module: {imports: () => []}},
-    createNavigation: () => ({dispose() {}, suppressClick: () => false}),
+    createNavigation: (element,view,changed) => {
+      navigate=(target,active)=>{view.set(target);changed(active);};
+      return {dispose() {}, suppressClick: () => false};
+    },
     createImageExport: (element, isCurrent) => ({cancel() {}, dispose() {}, prepare: frame => {
       assertLifecycle(isCurrent(frame), 'A stale frame was exported'); exportFrames.push(frame);
     }})
   };
-  const source = ['web/view.js', 'web/tile-queue.js', 'web/resize-scheduler.js', 'web/app.js']
+  const source = ['web/view.js', 'web/tile-queue.js', 'web/resize-scheduler.js', 'web/presentation.js', 'web/preview.js', 'web/app.js']
     .map(path => readText(path).replace(/^import .*\n/gm, '').replace(/^export /gm, '')
       .replace(/import\.meta/g, '({url:"https://test.invalid/web/app.js"})')).join('\n');
   const library = new Function(...Object.keys(globals), source + '\nreturn {start,createView,useCompactTiles,minimumTilePixels};')(...Object.values(globals));
-  const view = library.createView(); view.set({real: '0', imag: '1', zoom});
+  const view = library.createView(); view.set({real: '0', imag, zoom});
   root._mandelbrotView = view.snapshot(width, height);
-  const started = library.start(root, {workers: 1, preview, compactTiles, engineOptions, minTilePixels, export: {enabled: false}});
+  const started = library.start(root, {workers: 1, preview, progressive, compactTiles, engineOptions, minTilePixels, coldTiles, export: {enabled: false}});
   await advance(0);
   const app = await started;
   await advance(16);
@@ -132,7 +143,9 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
       assertLifecycle(worker, `No work remains for unfinished frame (${errors})`); worker.tile();
     }
   }
-  return {app, root, workers, canvases, timers, errors, exportFrames, active, advance, complete,
+  const observed=(physicalWidth=width,physicalHeight=height)=>resizeCallback([{contentRect:{width,height},
+    devicePixelContentBoxSize:[{inlineSize:physicalWidth,blockSize:physicalHeight}]}]);
+  return {app, root, workers, canvases, timers, errors, exportFrames, active, advance, complete, navigate, observed,
     useCompactTiles: library.useCompactTiles, minimumTilePixels: library.minimumTilePixels};
 }
 
@@ -176,18 +189,17 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
   }
   {
     const f = await lifecycleFixture({width: 1024, height: 512, preview: true});
-    const obsolete = f.active('reference')[0], hiddenCanvases = [...f.canvases];
-    await f.advance(200);
-    const current = f.active('reference')[0];
-    assertLifecycle(obsolete.terminated && current && current !== obsolete,
-      'Preview deadline did not immediately terminate active reference preparation');
-    assertLifecycle(hiddenCanvases.every(canvas => canvas.width === 0), 'Abandoned preview retained canvas backing stores');
-    obsolete.reference(); obsolete.onerror?.({message: 'late obsolete failure'});
-    assertLifecycle(!f.errors.length && f.root.dataset.state !== 'failed', 'Obsolete reference event affected its replacement');
+    const obsolete=f.active('reference')[0];
+    f.app.setView({real:'0',imag:'1',zoom:401});
+    assertLifecycle(obsolete.terminated,'Navigation did not terminate active reference preparation');
+    await f.advance(16);
+    const current=f.active('reference')[0];
+    obsolete.reference();obsolete.onerror?.({message:'late obsolete failure'});
+    assertLifecycle(!f.errors.length && current!==obsolete,'Obsolete reference affected its replacement');
     f.app.dispose();
-    assertLifecycle(current.terminated && f.active('engine').length === 0, 'Dispose retained active workers');
-    assertLifecycle(f.canvases.every(canvas => canvas.width === 0), 'Dispose retained an invisible frame');
-    assertLifecycle(f.timers.size === 0, 'Dispose retained scheduled work');
+    assertLifecycle(current.terminated && !f.active('engine').length && !f.active('preview').length,
+      'Dispose retained active workers');
+    assertLifecycle(f.canvases.every(canvas=>canvas.width===0) && !f.timers.size,'Dispose retained hidden resources');
   }
   {
     const f = await lifecycleFixture();
@@ -212,19 +224,18 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
     assertLifecycle(visible.surfaces.size > 0, 'Dispose removed the visible image needed for release handoff');
   }
   {
-    const f = await lifecycleFixture({width: 1024, height: 512, zoom: 40, preview: true});
-    const worker = f.active('engine')[0];
-    const initialGeneration = worker.jobs[0].generation;
-    let previewEvents = 0;
-    f.root.addEventListener('mandelbrot-preview', () => {
-      ++previewEvents; f.app.setView({real: '-0.75', imag: '0', zoom: 0});
+    const f=await lifecycleFixture({width:1024,height:512,zoom:0,preview:true});
+    let previewEvents=0;
+    f.root.addEventListener('mandelbrot-preview',()=>{
+      ++previewEvents;f.app.setView({real:'-0.75',imag:'0',zoom:0});
     });
-    while (!previewEvents) worker.tile();
-    assertLifecycle(!worker.messages.some(message => message.generation === initialGeneration + 1),
-      'Reentrant preview selection started the superseded final pass');
-    await f.advance(16); f.complete();
-    assertLifecycle(f.root.dataset.zoom === '0' && !f.errors.length, 'Reentrant navigation did not finish the latest viewport');
+    const obsolete=f.active('engine')[0];
+    f.active('preview')[0].preview();
+    assertLifecycle(previewEvents===1,'GPU preview event missing');
+    await f.advance(16);f.complete();
+    assertLifecycle(f.root.dataset.zoom==='0' && !f.errors.length,'Reentrant preview navigation failed');
     f.app.dispose();
+    assertLifecycle(!f.timers.size,'Preview disposal retained a timer');
   }
   {
     const f = await lifecycleFixture({width: 300, height: 1, zoom: 40});
@@ -285,7 +296,7 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
     [{engineOptions:3851,minTilePixels:255.1},true,256,[32,8]],
     [{engineOptions:3851,minTilePixels:0},true,1,[32,4]]
   ]) {
-    const f = await lifecycleFixture({width: 512, height: 128, zoom: 40, ...options});
+    const f = await lifecycleFixture({width: 512, height: 128, zoom: 40, coldTiles:false, ...options});
     const frames = [];
     f.root.addEventListener('mandelbrot-frame', event => frames.push(event.detail));
     const worker = f.active('engine')[0]; worker.tile({retries: 0}, 1000);
@@ -310,6 +321,84 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
     const worker = f.active('engine')[0]; worker.tile();
     assertLifecycle(!f.active('engine').length && f.timers.size === 0 && !f.errors.length,
       'Reentrant first-tile disposal left work running');
+  }
+  {
+    const f=await lifecycleFixture({width:513,height:129,zoom:0,imag:'0'});f.complete();
+    f.app.setView({real:'-0.75',imag:'0',zoom:1});f.observed(514,130);await f.advance(0);
+    const frame=f.root.children.find(child=>child._frame && child._frame.completed!==child._frame.total)?._frame;
+    assertLifecycle(frame?.width===514 && frame.height===130 && f.active('engine')[0].jobs.length,
+      'Stationary shallow selection waited another frame or ignored the observed physical raster');
+    f.complete();
+    f.navigate({real:'-0.7',imag:'0',zoom:2},true);f.observed();await f.advance(0);
+    assertLifecycle(!f.active('engine')[0].jobs.length,'Observed size released an active navigation gesture');
+    f.navigate({real:'0',imag:'1',zoom:40},false);f.observed();await f.advance(0);
+    assertLifecycle(!f.active('engine')[0].jobs.length,'Deep selection skipped its existing navigation window');
+    await f.advance(16);f.complete();f.app.dispose();
+    assertLifecycle(!f.errors.length && !f.timers.size,'Observed selection retained timers or resources');
+  }
+  {
+    const f=await lifecycleFixture({width:1024,height:512,zoom:40,imag:'0'});
+    const worker=f.active('engine')[0],first=worker.jobs[0];
+    assertLifecycle(first.width*first.height===256*64,'Analytic interior paid for unnecessary cold tiles');
+    worker.tile();
+    const frame=f.root.children.find(child=>child._frame)._frame;
+    assertLifecycle(frame.presentation.peakBufferBytes===0,'Fast interior retained speculative display pixels');
+    f.complete();f.app.dispose();
+    assertLifecycle(!f.errors.length && !f.timers.size,'Interior completion retained resources');
+  }
+  {
+    const f=await lifecycleFixture({width:1024,height:512,zoom:32});
+    const worker=f.active('engine')[0],first=worker.jobs[0];
+    assertLifecycle(first.width*first.height===256,'Cold precise code began with a long full-size tile');
+    worker.tile({ddIterations:1});
+    f.complete();
+    f.app.setView({real:'0',imag:'1',zoom:32.1});await f.advance(16);
+    const warm=worker.jobs[0];
+    assertLifecycle(warm.width*warm.height===256*64,'Warm precise code retained the startup estimate');
+    f.complete();f.app.dispose();
+  }
+  for(const zoom of [100,400,1600]) {
+    const f=await lifecycleFixture({width:1024,height:512,zoom}),events=[];
+    f.root.addEventListener('mandelbrot-present',event=>events.push(event.detail));
+    f.active('reference')[0].reference();
+    const worker=f.active('engine')[0],first=worker.jobs[0];
+    assertLifecycle(first.width*first.height===256*64,'Prepared global reference paid for small startup tiles');
+    worker.tile();await f.advance(16);
+    assertLifecycle(events.length===1 && !events[0].final && events[0].presentedPixels===first.width*first.height &&
+      !f.exportFrames.length,'Global-reference first tile was not shown before full export');
+    f.complete();f.app.dispose();
+    assertLifecycle(!f.errors.length && !f.timers.size,'Global-reference completion retained resources');
+  }
+  {
+    const f=await lifecycleFixture({width:1024,height:256,zoom:0,imag:'0'}),events=[];
+    f.root.addEventListener('mandelbrot-present',event=>events.push(event.detail));
+    const worker=f.active('engine')[0],job=worker.tile();
+    await f.advance(16);
+    assertLifecycle(events.length===1 && !events[0].final && events[0].completedPixels===job.width*job.height*2,
+      'First visible update lost mirrored pixels');
+    const frame=f.root.children.find(child=>child._frame)._frame;
+    assertLifecycle(frame.shown && frame.completed<frame.total && !f.exportFrames.length,'Partial frame stayed hidden or was exported');
+    worker.tile();worker.tile();await f.advance(124);
+    assertLifecycle(events.length===1,'Progress counter forced an extra image update');
+    await f.advance(17);assertLifecycle(events.length===2,'Accumulated tile results were not shown');
+    f.app.setView({real:'-0.75',imag:'0',zoom:1});
+    assertLifecycle(frame.surfaces.size===0 && f.root.children.filter(child=>child._preview).length===1,
+      'Canceled partial frame was not reduced to a bounded backdrop');
+    await f.advance(16);f.complete();
+    assertLifecycle(events.at(-1).final && f.exportFrames.length===1,'Final frame was not completely revealed before export');
+    f.app.dispose();assertLifecycle(!f.timers.size,'Partial cancellation retained timers');
+  }
+  {
+    const f=await lifecycleFixture({width:400,height:200,zoom:0,preview:true});f.complete();
+    f.navigate({real:'-0.75',imag:'0',zoom:1},true);await f.advance(40);
+    const worker=f.active('preview')[0];worker.preview();
+    assertLifecycle(f.root.children.some(child=>child._preview),'Live preview was discarded while exact rendering was held');
+    worker.preview();
+    f.navigate({real:'-0.75',imag:'0',zoom:40},true);await f.advance(34);
+    assertLifecycle(worker.jobs.at(-1).backend==='wasm','Deep live view did not use WASM fallback');
+    f.navigate({real:'-0.75',imag:'0',zoom:40},false);await f.advance(16);
+    assertLifecycle(worker.messages.some(m=>m.type==='cancel') && f.active('engine').some(w=>w.jobs.length),'Final work waited for the WASM preview');
+    f.complete();f.app.dispose();assertLifecycle(!f.timers.size && !f.errors.length,'Live preview lifecycle leaked resources');
   }
   report('App lifecycle: active reference abort, idle cache reuse, stale replies, preview supersession, transfer ownership, compact/minimum tile policies and telemetry, first-tile events and disposal passed.');
   testDone = true;

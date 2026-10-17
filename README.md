@@ -14,7 +14,9 @@ after its first successful installation. No external services or dependencies.
 - Right-click the completed image to copy or save a full-resolution PNG.
 - Copy the URL to share or restore the selected centre and zoom.
 
-Slow renders show completed pixels and percentage after 500 ms. English is
+Navigation uses an adaptive GPU preview where supported, with a WASM fallback.
+Accurate tiles appear progressively over the preview. Slow renders show completed
+pixels and percentage after 500 ms. English is
 the default; a German primary browser language selects German.
 
 ## Build

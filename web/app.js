@@ -3,6 +3,8 @@ import {createImageExport} from './image-export.js';
 import {createView, previewTransform, viewFragment, viewFromFragment} from './view.js';
 import {createNavigation} from './navigation.js';
 import {createTileQueue} from './tile-queue.js';
+import {createPresentation} from './presentation.js';
+import {createPreviewRenderer} from './preview.js';
 
 const TILE_WIDTH = 256, TILE_HEIGHT = 64, SURFACE_SIZE = 1024;
 // Keep the scheduling fallback aligned with the verified core default.
@@ -29,7 +31,7 @@ function minimumTilePixels(view, options, compactTiles = useCompactTiles(view, o
 }
 
 export async function start(root, options = {}) {
-  let disposed = false, pending, frameRequest = 0;
+  let disposed = false, pending, frameRequest = 0, selectionRequest = 0, navigationActive = false, previewWindow = false;
   let physicalSize, replacementCount = 0, fullscreenPending = false, referenceWorker, referenceIterations = 0;
   let referencePreparing = false, viewURL = location.hash;
   let progress, progressFill, progressPill, progressCompleted, progressPercent, progressTotal;
@@ -47,9 +49,13 @@ export async function start(root, options = {}) {
   const slots = [];
   const simdBytes = await loadBytes('engine-simd.wasm');
   const backend = WebAssembly.validate(simdBytes) ? 'simd128' : 'scalar';
-  const module = await WebAssembly.compile(backend === 'simd128' ? simdBytes : await loadBytes('engine-scalar.wasm'));
+  const wasmBytes = backend === 'simd128' ? simdBytes : await loadBytes('engine-scalar.wasm');
+  const module = await WebAssembly.compile(wasmBytes);
   if (WebAssembly.Module.imports(module).length) throw new Error('Unexpected WASM imports');
   const workerCount = Math.max(1, Math.min(8, options.workers || (navigator.hardwareConcurrency || 2) - 1));
+  const canvasReadFrequently = options.willReadFrequently===undefined ? options.progressive!==false : !!options.willReadFrequently;
+  const previews = options.preview === false ? null : createPreviewRenderer({module,engineOptions:options.engineOptions,
+    gpu:options.gpuPreview!==false,snapshot:(...args)=>view.snapshot(...args),show:showPreview});
   const imageExport = createImageExport(root, frame => !disposed && pending === frame &&
     frame.completed === frame.total && frame.shown && root.dataset.resizeMode === 'idle', options.export);
   const scheduler = createResizeScheduler({
@@ -66,12 +72,22 @@ export async function start(root, options = {}) {
     }
   });
   const navigation = createNavigation(root, view, active => {
+    navigationActive = active;
     if (active) { scheduler.hold(true); resize(); }
     else { saveURL(); selectView(); }
   });
   function selectView() {
+    navigationActive = false;
+    previewWindow = true;
     scheduler.hold(true); resize();
-    requestAnimationFrame(() => scheduler.hold(false));
+    // URL/API selections also have a navigation window before the next final
+    // frame. Use it for a bounded preview; final work never waits for it.
+    if(previews){const r=root.getBoundingClientRect(),dpr=devicePixelRatio||1;
+      const width=Math.round(r.width*dpr),height=Math.round(r.height*dpr);
+      if(width && height)previews.request({width,height,cssWidth:r.width,cssHeight:r.height,
+        view:view.snapshot(r.width,r.height,width,height)},true);}
+    cancelAnimationFrame(selectionRequest);
+    selectionRequest=requestAnimationFrame(()=>{selectionRequest=0;previewWindow=false;scheduler.hold(false);});
   }
   function saveURL() {
     const fragment = viewFragment(currentView());
@@ -109,8 +125,11 @@ export async function start(root, options = {}) {
         slot.busy = false; slot.job = null;
         if (!disposed && pending && data.generation === pending.generation && scheduler.accept(pending.id)) {
           const frame = pending;
+          const work=data.stats || {};
+          if(frame.view.deep && (work.ddIterations || work.perturbIterations || work.fixedIterations))
+            slot.warmPath=usePreciseSeries(frame.view,options)?'series':frame.view.perturb?'perturb':'local';
           frame.precisionHint = Math.max(frame.precisionHint || 0, data.precisionBits || 0);
-          frame.queue.observe(data.timing?.computeMilliseconds, data.width * data.height);
+          frame.queue.observe(data.timing?.computeMilliseconds,data.width*data.height);
           frame.tileTimes.push(data.timing?.computeMilliseconds || 0);
           frame.workerMilliseconds += data.timing?.computeMilliseconds || 0;
           frame.copyMilliseconds += data.timing?.copyMilliseconds || 0;
@@ -209,6 +228,7 @@ export async function start(root, options = {}) {
       const surface = frame.surfaces.get(`${Math.floor(x / SURFACE_SIZE)},${Math.floor(targetY / SURFACE_SIZE)}`);
       const part = pixels.subarray(row * width * 4, (row + rows) * width * 4);
       surface.context.putImageData(new ImageData(part, width, rows), x % SURFACE_SIZE, targetY % SURFACE_SIZE);
+      frame.presentation?.note(surface,x % SURFACE_SIZE,targetY % SURFACE_SIZE,width,rows,part);
       row += rows;
     }
   }
@@ -282,29 +302,91 @@ export async function start(root, options = {}) {
     progressPill?.remove(); progress = progressFill = progressPill = progressCompleted = progressPercent = progressTotal = null;
   }
 
-  function reveal(frame) {
-    if (disposed || pending !== frame || frame.shown) return;
+  function reveal(frame, complete = false) {
+    if (disposed || pending !== frame) return;
     frame.shown = true; frame.layer.style.visibility = 'visible';
     frame.layer.style.transform = previewTransform(frame.view, currentView(), root.clientWidth, root.clientHeight);
-    for (const child of [...root.children]) if (child !== frame.layer && child !== progressPill) {
-      releaseSurfaces(child._frame); child.remove();
-    }
+    if (complete) for (const child of [...root.children])
+      if (child !== frame.layer && (child._frame || child._preview)) {
+        releaseSurfaces(child._frame); child.remove();
+      }
     root.dataset.exportState = 'pending';
+  }
+
+  function showPreview(data) {
+    if (disposed || (!pending && !navigationActive && !previewWindow) ||
+        (pending && pending.completed===pending.total && !navigationActive && !previewWindow)) {
+      data.bitmap.close();return;
+    }
+    const frame = pending && pending.completed!==pending.total ? pending : null;
+    const layer=document.createElement('div');layer.className='frame';layer._preview=true;layer._view=data.view;
+    layer.style.transform=previewTransform(data.view,currentView(),root.clientWidth,root.clientHeight);
+    const canvas=document.createElement('canvas');canvas.width=data.width;canvas.height=data.height;
+    canvas.setAttribute('aria-hidden','true');Object.assign(canvas.style,{width:'100%',height:'100%'});
+    const bitmapContext=canvas.getContext('bitmaprenderer');
+    if(bitmapContext)bitmapContext.transferFromImageBitmap(data.bitmap);
+    else {canvas.getContext('2d',{alpha:false}).drawImage(data.bitmap,0,0);data.bitmap.close();}
+    layer.append(canvas);
+    for(const child of [...root.children])if(child!==frame?.layer && (child._frame || child._preview)) {
+      releaseSurfaces(child._frame);child.remove();
+    }
+    if(frame)root.insertBefore(layer,frame.layer);else root.append(layer);
+    root.dispatchEvent(new CustomEvent('mandelbrot-preview',{bubbles:true,detail:{
+      generation:frame?.generation,revision:data.view.revision,width:data.width,height:data.height,
+      milliseconds:data.milliseconds,computeMilliseconds:data.computeMilliseconds,zoom:data.view.zoom,backend:data.backend,
+      quality:{iterations:data.iterations,moving:data.moving}}}));
+  }
+
+  function presented(frame,detail) {
+    if(disposed || pending!==frame)return;
+    if(!detail.final)reveal(frame);
+    root.dispatchEvent(new CustomEvent('mandelbrot-present',{bubbles:true,detail:{
+      generation:frame.generation,width:frame.width,height:frame.height,phase:frame.kind,
+      completedPixels:frame.completedPixels,presentedPixels:detail.pixels,final:detail.final,milliseconds:performance.now()-frame.started,
+      presentationMilliseconds:detail.milliseconds,count:detail.count,interval:detail.interval}}));
+  }
+
+  // Bound abandoned partial images to a small backdrop. drawImage reads the
+  // existing raster without a GPU-to-CPU readback or a full-resolution copy.
+  function snapshotBackground() {
+    const rect=root.getBoundingClientRect(),scale=Math.min(1,320/Math.max(rect.width,rect.height));
+    if(!rect.width || !rect.height)return;
+    const layer=document.createElement('div');layer.className='frame';layer._preview=true;layer._view=root._mandelbrotView || currentView();
+    const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(rect.width*scale));
+    canvas.height=Math.max(1,Math.round(rect.height*scale));
+    canvas.setAttribute('aria-hidden','true');Object.assign(canvas.style,{width:'100%',height:'100%'});
+    const context=canvas.getContext('2d',{alpha:false});
+    for(const child of [...root.children])if(child._frame || child._preview) {
+      if(child.style.visibility==='hidden')continue;
+      const surfaces=child._frame?.surfaces;
+      if(surfaces?.size)for(const surface of surfaces.values()) {
+        const source=surface.display?.canvas || surface.context.canvas;
+        if(source.style.visibility==='hidden')continue;
+        const r=source.getBoundingClientRect();
+        if(surface.visibleRegions)for(const area of surface.visibleRegions)
+          context.drawImage(source,area.x,area.y,area.width,area.height,
+            (r.left-rect.left+area.x*r.width/source.width)*scale,(r.top-rect.top+area.y*r.height/source.height)*scale,
+            area.width*r.width/source.width*scale,area.height*r.height/source.height*scale);
+        else context.drawImage(source,(r.left-rect.left)*scale,(r.top-rect.top)*scale,r.width*scale,r.height*scale);
+      } else {
+        const source=child.querySelector('img') || child.querySelector('canvas');
+        if(source){const r=source.getBoundingClientRect();context.drawImage(source,
+          (r.left-rect.left)*scale,(r.top-rect.top)*scale,r.width*scale,r.height*scale);}
+      }
+    }
+    layer.append(canvas);
+    for(const child of [...root.children])if(child._frame || child._preview){releaseSurfaces(child._frame);child.remove();}
+    root.append(layer);
   }
 
   function finish() {
     const frame = pending;
-    clearTimeout(frame.previewTimer);
     if (frame.reference) frame.reference.buffer = null;
-    if (frame.preview) {
-      reveal(frame);
-      root.dispatchEvent(new CustomEvent('mandelbrot-preview', {bubbles:true,detail:{
-        width:frame.width,height:frame.height,milliseconds:performance.now()-frame.started,zoom:frame.view.zoom}}));
-      advanceFinal(frame);
-      return;
-    }
     if (!scheduler.complete(frame.id)) return;
-    clearTimeout(frame.revealTimer); hideProgress(frame); reveal(frame);
+    clearTimeout(frame.revealTimer); hideProgress(frame); reveal(frame,true);
+    frame.presentation?.finish();
+    if(disposed || pending!==frame)return;
+    previews?.stop();
     root.dataset.state = 'complete';
     root.dispatchEvent(new CustomEvent('mandelbrot-frame', {bubbles: true, detail: {
       width: frame.width, height: frame.height, milliseconds: performance.now() - frame.started,
@@ -325,14 +407,12 @@ export async function start(root, options = {}) {
       referenceCacheHit:frame.reference?.cacheHit || false,
       retainedReferenceBytes:0, transferBufferBytes:workerCount*TILE_WIDTH*TILE_HEIGHT*8,
       canvasBytes:frame.width*frame.height*4, canvasReadFrequently:frame.canvasReadFrequently,
-      previewMilliseconds:frame.job.previewMilliseconds || 0
+      previewMilliseconds:frame.job.previewMilliseconds || 0,
+      presentationCount:frame.presentation?.count || 0, revealMilliseconds:frame.presentation?.milliseconds || 0,
+      presentationCanvasBytes:frame.presentation?.peakCanvasBytes || 0,
+      presentationBufferBytes:frame.presentation?.peakBufferBytes || 0
     }}));
     if (frame.kind === 'final') imageExport.prepare(frame);
-  }
-
-  function advanceFinal(frame) {
-    if (pending!==frame || !scheduler.accept(frame.id)) return;
-    try { render(frame.finalSize,frame.job,true); } catch(error) { fail(error); }
   }
 
   function tileSummary(times) {
@@ -341,6 +421,7 @@ export async function start(root, options = {}) {
   }
   function releaseSurfaces(frame) {
     if (!frame?.surfaces) return;
+    frame.presentation?.dispose();
     for (const {context} of frame.surfaces.values()) { context.canvas.width=0; context.canvas.remove(); }
     frame.surfaces.clear();
   }
@@ -369,9 +450,9 @@ export async function start(root, options = {}) {
     if (pending?.id !== id) return;
     hideProgress(pending);
     clearTimeout(pending.revealTimer);
-    clearTimeout(pending.previewTimer);
     if (pending.reference) pending.reference.buffer=null;
-    if (!pending.shown) { releaseSurfaces(pending); pending.layer.remove(); }
+    if (pending.shown && pending.completed!==pending.total) snapshotBackground();
+    else if (!pending.shown) { releaseSurfaces(pending); pending.layer.remove(); }
     cancelReference();
     if (!disposed && pending.view.deep) for (const slot of [...slots]) if (slot.job?.generation === pending.generation) {
       slot.worker.terminate(); slots.splice(slots.indexOf(slot),1); newSlot().catch(fail);
@@ -379,16 +460,9 @@ export async function start(root, options = {}) {
     pending = null;
   }
 
-  function render(size, job, finalPass = false) {
+  function render(size, job) {
     if (disposed || !size.width || !size.height) return;
-    const finalSize = size;
-    const preview = !finalPass && options.preview !== false && job.kind === 'final' &&
-      size.view.zoom >= 16 && size.width*size.height > 262144;
-    if (preview) {
-      const scale=2**Math.ceil(Math.log2(Math.max(size.width,size.height)/160));
-      const width=Math.max(1,Math.round(size.width/scale)),height=Math.max(1,Math.round(size.height/scale));
-      size={...size,width,height,view:{...view.snapshot(size.cssWidth,size.cssHeight,width,height),iterations:size.view.iterations}};
-    }
+    previewWindow = false;
     const compactTiles = useCompactTiles(size.view,options);
     const requestedMinPixels = minimumTilePixels(size.view,options,compactTiles);
     const queue = createTileQueue(size.width,size.height,size.view,
@@ -396,11 +470,25 @@ export async function start(root, options = {}) {
     // Validate before allocating canvas backing stores. The queue rounds and
     // clamps the optional floor; telemetry reports that effective value.
     const minTilePixels = Math.max(1,Math.ceil(requestedMinPixels));
+    // The old coarse pass warmed WASM before large local-reference calls.
+    // Start cold local-reference code with small FINAL tiles instead: long
+    // baseline-compiled calls cannot benefit from a later tier-up on stack.
+    const warmPath=usePreciseSeries(size.view,options)?'series':size.view.perturb?'perturb':'local';
+    // These conservative interior disks do not need deep-code warm-up. Keep
+    // normal tiles and defer extra display copies until an update is needed.
+    // This affects scheduling only; WASM still computes every final pixel.
+    const radius=Math.hypot(size.width,size.height)*size.view.mantissa*2**size.view.exponent/2;
+    const analyticInterior=Math.hypot(size.view.centreReal,size.view.centreImag)+radius<.25 ||
+      Math.hypot(size.view.centreReal+1,size.view.centreImag)+radius<.25;
+    // Prepared global references retain normal batches. Small startup tiles
+    // slow that path without improving its already short first-tile latency.
+    const cold=options.coldTiles!==false && size.view.deep && !size.view.perturb &&
+      !analyticInterior && slots.some(slot=>slot.warmPath!==warmPath);
+    if(cold)queue.observe(12,Math.max(256,minTilePixels));
     imageExport.cancel();
     hideProgress(pending);
     if (pending) {
       clearTimeout(pending.revealTimer);
-      clearTimeout(pending.previewTimer);
       if (!pending.shown) { releaseSurfaces(pending); pending.layer.remove(); }
     }
     const layer = document.createElement('div'); layer.className = 'frame';
@@ -416,7 +504,7 @@ export async function start(root, options = {}) {
         // smoothly while a new full-resolution calculation is deferred.
         Object.assign(canvas.style, {left: `${100 * x / size.width}%`, top: `${100 * y / size.height}%`,
           width: `${100 * width / size.width}%`, height: `${100 * height / size.height}%`});
-        const context = canvas.getContext('2d', {alpha: false, willReadFrequently:!!options.willReadFrequently});
+        const context = canvas.getContext('2d', {alpha: false, willReadFrequently:canvasReadFrequently});
         if (!context) {
           canvas.width = 0; releaseSurfaces({surfaces}); layer.remove();
           fail(new Error('Canvas allocation failed')); return;
@@ -426,11 +514,11 @@ export async function start(root, options = {}) {
     }
     root.append(layer);
     pending = {...size, computedRows:queue.computedRows,mirroredRows:queue.mirroredRows, queue,
-      id: job.id, generation:job.id*2+(preview?0:1),kind: job.kind, layer, surfaces, completed: 0,
+      id: job.id, generation:job.id*2+1,kind: job.kind, layer, surfaces, completed: 0,
       completedPixels: 0, retry: [], shown: false, mirrorBuffer: new Uint8ClampedArray(TILE_WIDTH * TILE_HEIGHT * 4),
-      total:queue.total, started:job.started,preview,finalSize,job,stats:{},tileTimes:[],
+      total:queue.total, started:job.started,job,stats:{},tileTimes:[],
       workerMilliseconds:0,copyMilliseconds:0,presentationMilliseconds:0,roundTripMilliseconds:0,
-      canvasReadFrequently:!!options.willReadFrequently,compactTiles,minTilePixels};
+      canvasReadFrequently,compactTiles,minTilePixels,cold};
     layer._frame=pending;
     root.dataset.state = 'rendering';
     root.dataset.phase = job.kind;
@@ -442,20 +530,15 @@ export async function start(root, options = {}) {
       slot.worker.terminate(); slots.splice(slots.indexOf(slot),1); newSlot().catch(fail);
     }
     const frame = pending;
-    if (finalPass) job.previewMilliseconds=performance.now()-job.started;
-    if (preview) frame.previewTimer=setTimeout(()=>{
-      if(pending!==frame)return;
-      for(const slot of [...slots])if(slot.job?.generation===frame.generation){
-        slot.worker.terminate();slots.splice(slots.indexOf(slot),1);newSlot().catch(fail);
-      }
-      cancelReference();
-      advanceFinal(frame);
-    },200);
+    if(options.progressive!==false)frame.presentation=createPresentation(frame,detail=>presented(frame,detail),
+      {failed:fail,retainPixels:!analyticInterior});
+    previews?.request(size,false);
     if (job.kind === 'final') frame.progressTimer = setTimeout(() => showProgress(frame),
       Math.max(0, 500 - (performance.now() - frame.started)));
     // During navigation retain the complete transformed picture until the new
     // view is complete. Initial/window resize retain the existing presentation.
-    if (job.kind === 'final' && !size.view.revision) frame.revealTimer = setTimeout(() => reveal(frame), 500);
+    if (!frame.presentation && job.kind === 'final' && !size.view.revision)
+      frame.revealTimer = setTimeout(() => reveal(frame), 500);
     if (size.view.perturb) {
       if (referenceWorker && size.view.iterations*2<referenceIterations) {
         destroyReference();
@@ -484,9 +567,9 @@ export async function start(root, options = {}) {
     for (const slot of slots) dispatch(slot);
   }
 
-  function resize() {
-    if (disposed || frameRequest) return;
-    frameRequest = requestAnimationFrame(() => {
+  function resize(immediate = false) {
+    if (disposed || (frameRequest && immediate!==true)) return;
+    const updateSize = () => {
       frameRequest = 0;
       const rect = root.getBoundingClientRect(), dpr = devicePixelRatio || 1;
       const exact = physicalSize && physicalSize.dpr === dpr && physicalSize.cssWidth === rect.width &&
@@ -494,6 +577,7 @@ export async function start(root, options = {}) {
       try {
         const width = exact ? exact.width : Math.round(rect.width*dpr);
         if (!rect.width || !rect.height || !width) {
+          previews?.stop();
           scheduler.update({width:0,height:0,cssWidth:rect.width,cssHeight:rect.height}); return;
         }
         const height=exact ? exact.height : Math.round(rect.height*dpr);
@@ -501,10 +585,14 @@ export async function start(root, options = {}) {
         root._mandelbrotView=target;
         for (const child of root.children) if (child.style.visibility !== 'hidden' && child._view)
           child.style.transform = previewTransform(child._view,target,rect.width,rect.height);
-        scheduler.update({width: exact ? exact.width : Math.round(rect.width * dpr),
-          height: exact ? exact.height : Math.round(rect.height * dpr), cssWidth: rect.width, cssHeight: rect.height, view: target});
+        const size={width: exact ? exact.width : Math.round(rect.width * dpr),
+          height: exact ? exact.height : Math.round(rect.height * dpr), cssWidth: rect.width, cssHeight: rect.height, view: target};
+        if(navigationActive)previews?.request(size,true);
+        scheduler.update(size);
       } catch (error) { fail(error); }
-    });
+    };
+    if(immediate===true){cancelAnimationFrame(frameRequest);updateSize();}
+    else frameRequest=requestAnimationFrame(updateSize);
   }
   function currentView() { const r=root.getBoundingClientRect();return view.snapshot(r.width,r.height,Math.round(r.width*(devicePixelRatio||1))); }
 
@@ -512,7 +600,13 @@ export async function start(root, options = {}) {
     const entry = entries[0], box = entry.devicePixelContentBoxSize?.[0];
     if (box) physicalSize = {width: box.inlineSize, height: box.blockSize, dpr: devicePixelRatio || 1,
       cssWidth: entry.contentRect.width, cssHeight: entry.contentRect.height};
-    resize();
+    // A stationary shallow selection can use the exact observed raster now,
+    // without spending another display cycle waiting for its size.
+    if(previewWindow && selectionRequest && !navigationActive && box?.inlineSize>0 && box?.blockSize>0 &&
+        !view.snapshot(entry.contentRect.width,entry.contentRect.height,box.inlineSize,box.blockSize).deep) {
+      cancelAnimationFrame(selectionRequest);selectionRequest=0;
+      resize(true);previewWindow=false;scheduler.hold(false);
+    }else resize();
   });
   let densityQuery;
   function densityChanged() {
@@ -543,13 +637,13 @@ export async function start(root, options = {}) {
   }
   function dispose() {
     if (disposed) return;
-    disposed = true; observer.disconnect(); cancelAnimationFrame(frameRequest);
+    disposed = true; observer.disconnect(); cancelAnimationFrame(frameRequest);cancelAnimationFrame(selectionRequest);
     scheduler.dispose();
     imageExport.dispose();
     navigation.dispose(); destroyReference();
+    previews?.dispose();pending?.presentation?.dispose(pending.shown);
     hideProgress(pending);
     clearTimeout(pending?.revealTimer);
-    clearTimeout(pending?.previewTimer);
     if (pending && !pending.shown) { releaseSurfaces(pending); pending.layer.remove(); }
     densityQuery?.removeEventListener('change', densityChanged);
     window.removeEventListener('resize', resize); document.removeEventListener('visibilitychange', resume);
@@ -561,6 +655,10 @@ export async function start(root, options = {}) {
     slots.length = 0;
   }
 
+  if(previews){const r=root.getBoundingClientRect(),dpr=devicePixelRatio||1;
+    const width=Math.round(r.width*dpr),height=Math.round(r.height*dpr);
+    if(width && height){previewWindow=true;previews.request({width,height,cssWidth:r.width,cssHeight:r.height,
+      view:view.snapshot(r.width,r.height,width,height)},true);}}
   try { await Promise.all(Array.from({length: workerCount}, () => newSlot())); }
   catch (error) { dispose(); throw error; }
   try { observer.observe(root, {box: 'device-pixel-content-box'}); }
