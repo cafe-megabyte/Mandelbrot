@@ -319,6 +319,7 @@ export async function start(root, options = {}) {
       data.bitmap.close();return;
     }
     const frame = pending && pending.completed!==pending.total ? pending : null;
+    const retained = [...root.children].find(child=>child._retained);
     const layer=document.createElement('div');layer.className='frame';layer._preview=true;layer._view=data.view;
     layer.style.transform=previewTransform(data.view,currentView(),root.clientWidth,root.clientHeight);
     const canvas=document.createElement('canvas');canvas.width=data.width;canvas.height=data.height;
@@ -327,10 +328,12 @@ export async function start(root, options = {}) {
     if(bitmapContext)bitmapContext.transferFromImageBitmap(data.bitmap);
     else {canvas.getContext('2d',{alpha:false}).drawImage(data.bitmap,0,0);data.bitmap.close();}
     layer.append(canvas);
-    for(const child of [...root.children])if(child!==frame?.layer && (child._frame || child._preview)) {
+    for(const child of [...root.children])if(child!==frame?.layer && child!==retained && (child._frame || child._preview)) {
       releaseSurfaces(child._frame);child.remove();
     }
-    if(frame)root.insertBefore(layer,frame.layer);else root.append(layer);
+    // A short preview budget can produce black where accurate tiles already
+    // found detail. Keep those transformed tiles above the coarse preview.
+    if(retained || frame)root.insertBefore(layer,retained || frame.layer);else root.append(layer);
     root.dispatchEvent(new CustomEvent('mandelbrot-preview',{bubbles:true,detail:{
       generation:frame?.generation,revision:data.view.revision,width:data.width,height:data.height,
       milliseconds:data.milliseconds,computeMilliseconds:data.computeMilliseconds,zoom:data.view.zoom,backend:data.backend,
@@ -346,9 +349,11 @@ export async function start(root, options = {}) {
       presentationMilliseconds:detail.milliseconds,count:detail.count,interval:detail.interval}}));
   }
 
-  // Bound abandoned partial images to a small backdrop. drawImage reads the
-  // existing raster without a GPU-to-CPU readback or a full-resolution copy.
-  function snapshotBackground() {
+  // Compact only older backgrounds. The most recently displayed accurate
+  // tiles stay in their original canvases, including single-pixel scan bands.
+  function snapshotBackground(exclude) {
+    const layers=[...root.children].filter(child=>child!==exclude && (child._frame || child._preview));
+    if(!layers.length || (layers.length===1 && layers[0]._preview))return;
     const rect=root.getBoundingClientRect(),scale=Math.min(1,320/Math.max(rect.width,rect.height));
     if(!rect.width || !rect.height)return;
     const layer=document.createElement('div');layer.className='frame';layer._preview=true;layer._view=root._mandelbrotView || currentView();
@@ -356,7 +361,7 @@ export async function start(root, options = {}) {
     canvas.height=Math.max(1,Math.round(rect.height*scale));
     canvas.setAttribute('aria-hidden','true');Object.assign(canvas.style,{width:'100%',height:'100%'});
     const context=canvas.getContext('2d',{alpha:false});
-    for(const child of [...root.children])if(child._frame || child._preview) {
+    for(const child of layers) {
       if(child.style.visibility==='hidden')continue;
       const surfaces=child._frame?.surfaces;
       if(surfaces?.size)for(const surface of surfaces.values()) {
@@ -375,8 +380,20 @@ export async function start(root, options = {}) {
       }
     }
     layer.append(canvas);
-    for(const child of [...root.children])if(child._frame || child._preview){releaseSurfaces(child._frame);child.remove();}
-    root.append(layer);
+    for(const child of layers){releaseSurfaces(child._frame);child.remove();}
+    root.insertBefore(layer,exclude);
+  }
+
+  function retainBackground(frame) {
+    snapshotBackground(frame.layer);
+    // Freeze the visible presentation and release queued pixels and opaque
+    // staging stores. No resampling or canvas readback is needed for these tiles.
+    frame.presentation?.dispose(true);
+    if(frame.presentation)for(const [key,surface] of frame.surfaces) {
+      surface.context.canvas.width=0;surface.context.canvas.remove();
+      if(!surface.display)frame.surfaces.delete(key);
+    }
+    frame.layer._retained=true;
   }
 
   function finish() {
@@ -451,7 +468,7 @@ export async function start(root, options = {}) {
     hideProgress(pending);
     clearTimeout(pending.revealTimer);
     if (pending.reference) pending.reference.buffer=null;
-    if (pending.shown && pending.completed!==pending.total) snapshotBackground();
+    if (pending.shown && pending.completed!==pending.total) retainBackground(pending);
     else if (!pending.shown) { releaseSurfaces(pending); pending.layer.remove(); }
     cancelReference();
     if (!disposed && pending.view.deep) for (const slot of [...slots]) if (slot.job?.generation === pending.generation) {

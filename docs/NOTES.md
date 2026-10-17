@@ -22,6 +22,10 @@ Updated 17 October 2026. Keep this file brief; generated reports belong in
   every final pixel is still computed by the original WASM core. A stationary
   shallow selection starts once its exact observed raster is available,
   without another display-cycle delay; active gestures keep their hold.
+- Zooming retains the latest visible partial tiles at their original resolution,
+  above coarse previews, including when a preview times out or is black. Frozen
+  staging stores and queued bytes are released; older backgrounds are compacted
+  so only one accurate fallback remains. Browser regression: `partial-zoom.html`.
 - The numerical core remains the original baseline. An exact-centre experiment
   was reverted: it exposed broader existing coordinate/colour issues.
   Numerical repairs require separate scope.
@@ -66,7 +70,9 @@ Updated 17 October 2026. Keep this file brief; generated reports belong in
   kernel-only measurements are not browser latency. Budget: at most 16 MiB extra per worker.
 - Progressive display temporarily adds up to four bytes per frame pixel
   (about 32 MiB at 4K, 127 MiB at 8K) plus the bounded tile pool, outside worker memory. Fast frames may
-  finish before any display buffers are allocated. Benchmark GPU/compositor
+  finish before any display buffers are allocated. A canceled partial frame may
+  retain one additional display raster during navigation, without its staging
+  stores or tile pool. Benchmark GPU/compositor
   work with the target raster fully inside the browser viewport.
 
 ## Documentation policy

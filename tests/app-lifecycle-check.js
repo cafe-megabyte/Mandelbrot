@@ -381,12 +381,41 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
     worker.tile();worker.tile();await f.advance(124);
     assertLifecycle(events.length===1,'Progress counter forced an extra image update');
     await f.advance(17);assertLifecycle(events.length===2,'Accumulated tile results were not shown');
+    const displays=[...frame.surfaces.values()].map(surface=>surface.display.canvas);
     f.app.setView({real:'-0.75',imag:'0',zoom:1});
-    assertLifecycle(frame.surfaces.size===0 && f.root.children.filter(child=>child._preview).length===1,
-      'Canceled partial frame was not reduced to a bounded backdrop');
+    assertLifecycle(frame.layer._retained && frame.layer.parentNode===f.root &&
+      displays.every(canvas=>canvas.width===1024 && canvas.parentNode===frame.layer) &&
+      [...frame.surfaces.values()].every(surface=>surface.context.canvas.width===0) &&
+      frame.presentation.retainedBufferBytes===0,
+      'Canceled partial frame lost its visible tiles or retained staging/pixel buffers');
     await f.advance(16);f.complete();
-    assertLifecycle(events.at(-1).final && f.exportFrames.length===1,'Final frame was not completely revealed before export');
+    assertLifecycle(events.at(-1).final && f.exportFrames.length===1 && displays.every(canvas=>canvas.width===0) &&
+      !f.root.children.some(child=>child._retained),'Final frame did not replace and release the retained partial tiles');
     f.app.dispose();assertLifecycle(!f.timers.size,'Partial cancellation retained timers');
+  }
+  {
+    const f=await lifecycleFixture({width:2048,height:1024,zoom:40,preview:true,coldTiles:false,compactTiles:false});
+    const worker=f.active('engine')[0];worker.tile({},1000);
+    await f.advance(16);worker.tile();await f.advance(141);
+    const first=f.root.children.find(child=>child._frame)._frame;
+    const surface=[...first.surfaces.values()].find(surface=>surface.display),display=surface.display.canvas;
+    assertLifecycle(surface.visibleRegions.some(region=>region.height===1),'Fixture did not display a single-pixel scan band');
+    f.navigate({real:'0',imag:'1',zoom:40.5},true);await f.advance(16);
+    assertLifecycle(display.width===1024 && display.parentNode===first.layer && first.layer.style.transform.includes('scale('),
+      'Navigation resampled or discarded fine partial tiles');
+    const preview=f.active('preview')[0];preview.preview();
+    assertLifecycle(first.layer.parentNode===f.root &&
+      f.root.children.indexOf(first.layer)>f.root.children.findIndex(child=>child._preview),
+      'A coarse preview covered or discarded the accurate navigation fallback');
+    f.navigate({real:'0',imag:'1',zoom:41},false);await f.advance(16);
+    const next=f.active('engine')[0];next.tile();await f.advance(16);
+    const second=[...f.root.children].reverse().find(child=>child._frame)._frame;
+    f.navigate({real:'0',imag:'1',zoom:41.5},true);
+    assertLifecycle(display.width===0 && first.surfaces.size===0 && second.layer._retained &&
+      f.root.children.filter(child=>child._retained).length===1 && f.root.children.filter(child=>child._preview).length===1,
+      'Repeated partial navigation accumulated full-resolution backgrounds');
+    f.navigate({real:'0',imag:'1',zoom:42},false);await f.advance(16);f.complete();f.app.dispose();
+    assertLifecycle(!f.errors.length && !f.timers.size,'Retained partial navigation leaked callbacks or timers');
   }
   {
     const f=await lifecycleFixture({width:400,height:200,zoom:0,preview:true});f.complete();

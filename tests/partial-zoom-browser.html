@@ -1,0 +1,95 @@
+<!doctype html><meta charset="utf-8"><title>Mandelbrot partial zoom checks</title>
+<style>
+body{margin:20px;background:#17191f;color:#eee;font:14px system-ui}pre{white-space:pre-wrap}
+#host{position:relative;width:480px;height:240px;overflow:hidden;background:#000}
+.frame{position:absolute;inset:0;overflow:hidden;background:#000}canvas{position:absolute;display:block}
+</style>
+<h1>Partial image zoom</h1><pre id="report">Running…</pre><div id="host"></div>
+<script type="module">
+const host=document.getElementById('host'),report=document.getElementById('report');
+const assert=(value,message)=>{if(!value)throw Error(message);};
+const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function until(predicate){for(let n=0;n<500;++n){if(predicate())return;await delay(10);}throw Error('Test timed out');}
+const log=text=>{report.textContent+='\n'+text;};
+const RealWorker=window.Worker,workers=[];let app,blackPreviews=false,previews=0;
+try {
+  const release=(await(await fetch('/web/release.txt')).text()).trim();
+  const {start}=await import(`/web/releases/${release}/app.js`);
+  const {createView}=await import(`/web/releases/${release}/view.js`);
+  const view=createView();view.set({real:'0',imag:'1',zoom:40});
+  host._mandelbrotView=view.snapshot(480,240);
+  // Control result timing while using the production app, navigation, scheduler
+  // and native Canvas. A stalled preview must leave the visible tiles intact.
+  window.Worker=class {
+    constructor(url){this.kind=String(url).includes('preview-worker')?'preview':String(url).includes('reference-worker')?'reference':'engine';
+      this.jobs=[];this.timers=new Set();workers.push(this);}
+    later(fn){const timer=setTimeout(()=>{this.timers.delete(timer);if(!this.terminated)fn();},0);this.timers.add(timer);}
+    postMessage(data){
+      if(data.type==='init')this.later(()=>this.emit({type:'ready',gpu:false}));
+      if(data.type==='prepare')this.later(()=>this.emit({...data,type:'reference',bits:1024,buffer:new ArrayBuffer(1024)}));
+      if(data.type==='render'){
+        this.jobs.push(data);
+        if(this.kind==='preview' && blackPreviews)this.later(()=>{
+          const output=new OffscreenCanvas(data.width,data.height);
+          output.getContext('2d',{alpha:false});
+          this.emit({...data,type:'preview',backend:'wasm',iterations:data.view.iterations,milliseconds:1,bitmap:output.transferToImageBitmap()});
+        });
+      }
+    }
+    emit(data){this.onmessage?.({data});}
+    terminate(){this.terminated=true;for(const timer of this.timers)clearTimeout(timer);this.timers.clear();}
+    tile(colour=[240,80,20,255],milliseconds=1){
+      const job=this.jobs.shift();assert(job,'Missing controlled tile');
+      const pixels=new Uint8ClampedArray(job.buffer,0,job.width*job.height*4);
+      for(let i=0;i<pixels.length;i+=4)pixels.set(colour,i);
+      this.emit({...job,type:'tile',buffer:pixels.buffer,timing:{computeMilliseconds:milliseconds,copyMilliseconds:0}});
+      return job;
+    }
+  };
+  const engine=()=>workers.find(worker=>worker.kind==='engine' && !worker.terminated);
+  const currentFrame=()=>[...host.children].reverse().find(child=>child._frame && !child._retained)?._frame;
+  host.addEventListener('mandelbrot-preview',()=>++previews);
+  app=await start(host,{workers:1,compactTiles:false,coldTiles:false,export:{enabled:false}});
+  await until(()=>engine()?.jobs.length);engine().tile(undefined,1000);
+  await until(()=>currentFrame()?.shown);
+  const green=[53,220,120,255],thin=engine().tile(green);
+  assert(thin.height===1,'Fixture did not produce a single-pixel scan band');
+  await until(()=>[...currentFrame().surfaces.values()].some(surface=>surface.visibleRegions?.some(region=>region.height===1)));
+  const first=currentFrame(),surface=first.surfaces.get(`${Math.floor(thin.x/1024)},${Math.floor(thin.y/1024)}`);
+  const display=surface.display.canvas,displayWidth=display.width,x=thin.x%1024,y=thin.y%1024;
+  const exact=()=>[...surface.display.getImageData(x,y,thin.width,1).data].every((value,index)=>value===green[index%4]);
+  assert(exact(),'Partial tile bytes changed before navigation');
+  const bounds=display.getBoundingClientRect(),anchor={x:bounds.left+(x+thin.width/2)*bounds.width/display.width,
+    y:bounds.top+(y+.5)*bounds.height/display.height};
+  function zoom(){host.dispatchEvent(new WheelEvent('wheel',{deltaY:-50,clientX:anchor.x,clientY:anchor.y,bubbles:true,cancelable:true}));}
+  zoom();
+  assert(first.layer._retained && display.width===displayWidth && exact(),'Zoom immediately discarded or resampled the partial image');
+  await delay(100);
+  assert(!previews && display.parentNode===first.layer && exact() && first.layer.style.transform.includes('scale('),
+    'Preview timeout lost the scaled partial image');
+  assert([...first.surfaces.values()].every(surface=>surface.context.canvas.width===0) && first.presentation.retainedBufferBytes===0,
+    'Frozen partial image retained staging stores or tile buffers');
+  log('PASS: partial tiles, including a one-pixel band, remain exact and scale immediately while preview work times out.');
+  blackPreviews=true;zoom();await until(()=>previews>0);
+  const previewLayer=[...host.children].find(child=>child._preview),previewCanvas=previewLayer.querySelector('canvas');
+  // The preview is deliberately opaque black, as with an insufficient iteration budget.
+  assert(previewCanvas && display.parentNode===first.layer && exact() &&
+    [...host.children].indexOf(first.layer)>[...host.children].indexOf(previewLayer),
+    'Black coarse preview covered the previously accurate partial tiles');
+  log('PASS: a black coarse preview stays below the retained accurate tiles.');
+  await until(()=>engine()?.jobs.length && currentFrame());engine().tile();
+  await until(()=>currentFrame()?.shown);
+  const second=currentFrame(),secondDisplay=[...second.surfaces.values()].find(surface=>surface.display).display.canvas;
+  zoom();
+  assert(second.layer._retained && secondDisplay.width>0 && display.width===0 && first.surfaces.size===0 &&
+    [...host.children].filter(child=>child._retained).length===1 && [...host.children].filter(child=>child._preview).length===1,
+    'Repeated partial zoom accumulated full-resolution backgrounds');
+  await until(()=>engine()?.jobs.length && currentFrame());
+  for(let n=0;host.dataset.state!=='complete';++n){assert(n<10000,'Final frame did not complete');engine().tile();}
+  assert(secondDisplay.width===0 && ![...host.children].some(child=>child._retained) && host.querySelectorAll('.frame').length===1,
+    'Completion did not release the partial background');
+  log('PASS: repeated partial zoom keeps one accurate fallback; completion releases it.');
+  log('ALL CHECKS PASSED');
+} catch(error){log(`FAIL: ${error.stack||error}`);}
+finally {app?.dispose();window.Worker=RealWorker;}
+</script>

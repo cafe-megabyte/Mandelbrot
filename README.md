@@ -15,6 +15,7 @@ after its first successful installation. No external services or dependencies.
 - Copy the URL to share or restore the selected centre and zoom.
 
 Navigation uses an adaptive GPU preview where supported, with a WASM fallback.
+Already visible partial tiles stay enlarged while navigating, even if a preview times out.
 Accurate tiles appear progressively over the preview. Slow renders show completed
 pixels and percentage after 500 ms. English is
 the default; a German primary browser language selects German.

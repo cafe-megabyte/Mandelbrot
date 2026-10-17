@@ -28,13 +28,14 @@ done
 mkdir -p "$INTERNAL/tests/browser"
 cp tests/browser.html "$INTERNAL/tests/browser/index.html"
 cp tests/zoom-browser.html "$INTERNAL/tests/browser/zoom.html"
+cp tests/partial-zoom-browser.html "$INTERNAL/tests/browser/partial-zoom.html"
 cp tests/export-regression.html "$INTERNAL/tests/browser/export.html"
 cp tests/performance-browser.html "$INTERNAL/tests/browser/performance.html"
 cp tests/rendering-browser.html "$INTERNAL/tests/browser/rendering.html"
 cp tests/fixtures/regions.json "$INTERNAL/tests/regions.json"
 cp tests/numerical-oracle.js "$INTERNAL/tests/numerical-oracle.js"
 "$INTERNAL/host-tools/fixtures" build/web "$INTERNAL/tests"
-for SOURCE in web/index.html tests/browser.html tests/optimization-benchmark.html tests/zoom-browser.html tests/export-regression.html tests/performance-browser.html tests/rendering-browser.html; do
+for SOURCE in web/index.html tests/browser.html tests/optimization-benchmark.html tests/zoom-browser.html tests/partial-zoom-browser.html tests/export-regression.html tests/performance-browser.html tests/rendering-browser.html; do
     sed -n '/<script type="module">/,/<\/script>/p' "$SOURCE" | sed '1d;$d' > "$INTERNAL/tmp/shell-syntax.js"
     printf 'new (Object.getPrototypeOf(async function(){}).constructor)(readText("build/internal/tmp/shell-syntax.js"));var testDone=true;\n' > "$INTERNAL/tmp/parse.js"
     "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" "$INTERNAL/tmp/parse.js"
