@@ -1,3 +1,6 @@
+import {createMetadataChunks} from './png-metadata.js';
+import {createSrgbChunks} from './srgb-profile.js';
+
 // Encode bounded RGBA strips; no full-image canvas or second fractal calculation.
 const CRC_TABLE = new Uint32Array(256);
 for (let n = 0; n < 256; ++n) {
@@ -26,6 +29,8 @@ function init(message) {
   ({width, height} = message); nextY = 0; adlerA = 1; adlerB = 0;
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 ||
       width > 0x7fffffff || height > 0x7fffffff) throw new Error('Invalid PNG dimensions');
+  if (message.metadata?.schema_version !== 1 || message.metadata.width !== width || message.metadata.height !== height)
+    throw new Error('Missing or inconsistent PNG metadata');
   filteredWorkspace = new Uint8Array((width * 4 + 1) * Math.min(32, height));
   metrics = {filterMilliseconds: 0, compressionMilliseconds: 0, filterBufferAllocations: 1,
     filterBufferBytes: filteredWorkspace.byteLength, bands: 0, inputBytes: 0, returnedBuffers: 0,
@@ -33,6 +38,7 @@ function init(message) {
   const header = new Uint8Array(13), view = new DataView(header.buffer);
   view.setUint32(0, width); view.setUint32(4, height); header[8] = 8; header[9] = 6;
   parts = [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10])]; appendChunk('IHDR', header);
+  for (const {type, data} of [...createSrgbChunks(), ...createMetadataChunks(message.metadata)]) appendChunk(type, data);
   // The uncompressed zlib fallback also works on older SIMD-capable browsers.
   writer = null; readerDone = null;
   if (typeof CompressionStream === 'function' && message.compression !== 'store') {

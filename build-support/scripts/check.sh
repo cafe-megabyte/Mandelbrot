@@ -10,6 +10,7 @@ INTERNAL="$PWD/build/internal"
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/wasm-compare.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/deep-wasm-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/view-url-check.js
+"$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/png-metadata-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/symmetry-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/resize-scheduler-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/tile-queue-check.js
@@ -19,7 +20,7 @@ INTERNAL="$PWD/build/internal"
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/presentation-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/preview-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/preview-worker-check.js
-for SOURCE in web/presentation.js web/preview.js web/preview-worker.js web/app.js web/resize-scheduler.js web/image-export.js web/png-worker.js web/engine-worker.js web/view.js web/navigation.js web/reference-worker.js web/service-worker.js web/tile-queue.js; do
+for SOURCE in web/presentation.js web/preview.js web/preview-worker.js web/app.js web/resize-scheduler.js web/image-export.js web/png-worker.js web/png-metadata.js web/srgb-profile.js web/engine-worker.js web/view.js web/navigation.js web/reference-worker.js web/service-worker.js web/tile-queue.js; do
     sed '/^import /d;s/^export //' "$SOURCE" > "$INTERNAL/tmp/js-syntax.js"
     printf 'new Function(readText("build/internal/tmp/js-syntax.js").replace(/import\\.meta/g,"({url: \\\"file:///test/\\\"})")); var testDone=true;\n' > "$INTERNAL/tmp/parse.js"
     "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" "$INTERNAL/tmp/parse.js"

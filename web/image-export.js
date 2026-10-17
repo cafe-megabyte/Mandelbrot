@@ -1,3 +1,5 @@
+import {createPngMetadata} from './png-metadata.js';
+
 const SURFACE_SIZE = 1024;
 
 export function createImageExport(root, isCurrent, options = {}) {
@@ -16,6 +18,7 @@ export function createImageExport(root, isCurrent, options = {}) {
     if (!isCurrent(frame) || frame.layer.querySelector('img') || task?.frame === frame) return;
     cancel();
     try {
+      const metadata = createPngMetadata(frame);
       const worker = new Worker(new URL('./png-worker.js', import.meta.url), {type: 'module'});
       const job = {worker, frame, started: performance.now(), readbackMilliseconds: 0, packingMilliseconds: 0,
         readbackCalls: 0, readbackBytes: 0, transferBufferAllocations: 0, transferBufferBytes: 0};
@@ -82,7 +85,7 @@ export function createImageExport(root, isCurrent, options = {}) {
           } else if (data.type === 'error') throw new Error(data.message);
         } catch (error) { console.debug('Mandelbrot PNG:', error.message); if (task === job) cancel(); }
       };
-      worker.postMessage({type: 'init', width: frame.width, height: frame.height});
+      worker.postMessage({type: 'init', width: frame.width, height: frame.height, metadata});
     } catch (error) { console.debug('Mandelbrot PNG:', error.message); cancel(); }
   }
   function dispose() { disposed = true; cancel(); }

@@ -196,7 +196,7 @@ build_web() {
     STAGE="$INTERNAL/web/staging"
     rm -rf "$STAGE"; mkdir -p "$STAGE/releases/$RELEASE"
     if [ -d build/web/releases ]; then cp -R build/web/releases/. "$STAGE/releases/"; fi
-    cp web/presentation.js web/preview.js web/preview-worker.js web/app.js web/resize-scheduler.js web/image-export.js web/png-worker.js web/engine-worker.js web/view.js web/navigation.js web/reference-worker.js web/tile-queue.js "$STAGE/releases/$RELEASE/"
+    cp web/presentation.js web/preview.js web/preview-worker.js web/app.js web/resize-scheduler.js web/image-export.js web/png-worker.js web/png-metadata.js web/srgb-profile.js web/engine-worker.js web/view.js web/navigation.js web/reference-worker.js web/tile-queue.js "$STAGE/releases/$RELEASE/"
     cp "$INTERNAL/wasm/"*.wasm "$STAGE/releases/$RELEASE/"
     cp "$INTERNAL/toolchain/xcc/source/LICENSE" "$STAGE/releases/$RELEASE/XCC-LICENSE.txt"
     printf '%s\n' "$RELEASE" > "$STAGE/release.txt"

@@ -59,6 +59,8 @@ membership. Deep zoom can take minutes and is limited by time and memory.
 Keep numerical results and full-resolution output intact when optimizing.
 
 See [development notes](docs/NOTES.md) and [4K references](docs/baseline-4k.md).
+Exported PNGs include exact view metadata and an embedded sRGB profile;
+see [PNG metadata](docs/png-metadata.md).
 Bundled linker: [source record](vendor/SOURCE_ARCHIVES.md),
 [XCC MIT license](vendor/XCC-LICENSE.txt).
 

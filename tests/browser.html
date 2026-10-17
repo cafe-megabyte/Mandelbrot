@@ -463,6 +463,7 @@ document.getElementById('image-export').onclick=async()=>{
     log('PASS: full-image PNG, native context menu, panning instead of image drag and retired URL lifetime.');
 
     const release=root.dataset.release;
+    const {createPngMetadata}=await import(`/web/releases/${release}/png-metadata.js`);
     for(const compression of ['deflate','store'])for(const w of [137,513]){
       const h=73;
       const blob=await new Promise((resolve,reject)=>{
@@ -478,7 +479,8 @@ document.getElementById('image-export').onclick=async()=>{
           }
           worker.postMessage({type:'band',y:data.y,height:data.height,buffer:pixels.buffer},[pixels.buffer]);
         };
-        worker.postMessage({type:'init',width:w,height:h,compression});
+        worker.postMessage({type:'init',width:w,height:h,compression,
+          metadata:createPngMetadata({view:root._mandelbrotView,width:w,height:h})});
       });
       const bitmap=await createImageBitmap(blob),canvas=document.createElement('canvas');canvas.width=w;canvas.height=h;
       const context=canvas.getContext('2d');context.drawImage(bitmap,0,0);bitmap.close();

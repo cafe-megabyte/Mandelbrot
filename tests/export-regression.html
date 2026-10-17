@@ -1,9 +1,9 @@
 <!doctype html>
 <html lang="en">
 <meta charset="utf-8">
-<title>PNG buffers and offline verification checks</title>
+<title>PNG metadata, sRGB, buffers and offline verification checks</title>
 <style>body{font:14px system-ui;margin:24px}pre{white-space:pre-wrap}.picture{position:relative;width:700px;height:361px}.picture>div{position:absolute;inset:0}.picture canvas{position:absolute;display:none}</style>
-<button id="run">Check PNG buffers, pixels and offline verification</button>
+<button id="run">Check PNG metadata, sRGB, buffers, pixels and offline verification</button>
 <pre id="report"></pre><div id="host" class="picture"></div>
 <script type="module">
 const report=document.getElementById('report'), button=document.getElementById('run');
@@ -11,20 +11,133 @@ const assert=(ok,message)=>{if(!ok)throw new Error(message);};
 const log=message=>report.textContent+=`${message}\n`;
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const source=new URL(new URLSearchParams(location.search).get('source')||'/web/',location.href);
-let releaseBase, serviceText;
+let releaseBase, serviceText, createPngMetadata, createView, fixedDecimal;
+const utf8=new TextDecoder('utf-8',{fatal:true});
+const xmpNamespace='https://github.com/cafe-megabyte/Mandelbrot/ns/1.0/';
+const xmpFields=['SchemaVersion','Fractal','CenterX','CenterY','ZoomExponent','ZoomBase','Width','Height',
+  'ImaginaryAxis','PixelMapping','PrecisionBits','Iterations','PixelStepMantissa','PixelStepExponent','ColorSpace','ICCProfile'];
+function testView(zoom=5){
+  const view=createView();view.set({real:'-0.74364388703715100000000000000000000000000000001',
+    imag:'0.13182590420533000000000000000000000000000000003',zoom});return view.snapshot(513,65);
+}
+function assertMetadata(actual,view,width,height){
+  const expected={schema_version:1,fractal:'Mandelbrot',center_x:fixedDecimal(view.real,view.bits),
+    center_y:fixedDecimal(view.imag,view.bits),zoom_exponent:String(view.zoom),zoom_base:2,width,height,
+    imaginary_axis:'up',pixel_mapping:'mandelbrot-view-v1',precision_bits:view.bits,iterations:view.iterations,
+    pixel_step_mantissa:String(view.mantissa),pixel_step_exponent:view.exponent,color_space:'sRGB',icc_profile:'sRGB IEC61966-2.1'};
+  assert(JSON.stringify(actual)===JSON.stringify(expected),'Metadata differs from final rendering snapshot');
+  assert(actual.center_x!==String(Number(actual.center_x))&&actual.center_y!==String(Number(actual.center_y)),
+    'High-precision test coordinates do not exceed Number precision');
+  if(view.zoom===5)assert(actual.zoom_exponent==='5'&&2**Number(actual.zoom_exponent)===32,'Zoom exponent was replaced by zoom factor');
+}
+function readIfd(bytes,offset){
+  const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength),entries=new Map(),sizes={2:1,3:2,4:4,7:1};
+  assert(offset%2===0&&offset>=8&&offset+2<=bytes.length,'IFD offset/alignment');
+  const count=view.getUint16(offset,true),end=offset+2+count*12;
+  assert(end+4<=bytes.length&&view.getUint32(end,true)===0,'IFD bounds/termination');
+  let previous=-1;
+  for(let i=0;i<count;++i){
+    const p=offset+2+i*12,tag=view.getUint16(p,true),type=view.getUint16(p+2,true),length=view.getUint32(p+4,true);
+    assert(tag>previous&&sizes[type]&&length>0,'IFD order/type/count');previous=tag;
+    const size=length*sizes[type],start=size<=4?p+8:view.getUint32(p+8,true);
+    assert(start>=8&&start+size<=bytes.length&&(size<=4||start%2===0),'TIFF value bounds/alignment');
+    const data=bytes.subarray(start,start+size);
+    if(type===2)assert(data.at(-1)===0&&data.subarray(0,-1).every(byte=>byte>0&&byte<128),'TIFF ASCII termination/encoding');
+    entries.set(tag,{type,count:length,data,view:new DataView(data.buffer,data.byteOffset,data.byteLength)});
+  }
+  return entries;
+}
+function validateExif(bytes,metadata){
+  const view=new DataView(bytes.buffer,bytes.byteOffset,bytes.byteLength);
+  assert(bytes[0]===0x49&&bytes[1]===0x49&&view.getUint16(2,true)===42&&view.getUint32(4,true)===8,'Bare TIFF header');
+  const ifd=readIfd(bytes,8);assert(ifd.size===4,'Unexpected IFD0 fields');
+  for(const [tag,key]of [[0xff58,'center_x'],[0xff59,'center_y'],[0xff5a,'zoom_exponent']]){
+    const entry=ifd.get(tag);assert(entry?.type===2&&utf8.decode(entry.data.subarray(0,-1))===metadata[key],`Private EXIF ${key}`);
+  }
+  const pointer=ifd.get(0x8769);assert(pointer?.type===4&&pointer.count===1,'ExifIFD pointer');
+  const exif=readIfd(bytes,pointer.view.getUint32(0,true));assert(exif.size===7,'Unexpected ExifIFD fields');
+  for(const [tag,expected]of [[0x9000,'0232'],[0xa000,'0100']])
+    assert(exif.get(tag)?.type===7&&utf8.decode(exif.get(tag).data)===expected,'EXIF standard version');
+  assert(exif.get(0x9101)?.type===7&&exif.get(0x9101).data.join(',')==='4,5,6,0','EXIF RGB components');
+  assert(exif.get(0xa001)?.type===3&&exif.get(0xa001).view.getUint16(0,true)===1,'EXIF sRGB assignment');
+  for(const [tag,value]of [[0xa002,metadata.width],[0xa003,metadata.height]])
+    assert(exif.get(tag)?.type===4&&exif.get(tag).view.getUint32(0,true)===value,'EXIF dimensions');
+  const comment=exif.get(0x9286);assert(comment?.type===7,'UserComment type');
+  assert(comment.data.subarray(0,8).join(',')==='65,83,67,73,73,0,0,0','UserComment ASCII prefix');
+  assert(comment.data.subarray(8).every(byte=>byte<128),'UserComment is not ASCII');
+  assert(JSON.stringify(JSON.parse(utf8.decode(comment.data.subarray(8))))===JSON.stringify(metadata),'EXIF JSON disagrees');
+}
+async function inflate(bytes){return new Uint8Array(await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'))).arrayBuffer());}
+async function validateProfile(chunks){
+  const data=chunks.find(chunk=>chunk.type==='iCCP').data,zero=data.indexOf(0);
+  assert(utf8.decode(data.subarray(0,zero))==='sRGB IEC61966-2.1'&&data[zero+1]===0,'ICC name/compression');
+  const profile=await inflate(data.subarray(zero+2)),view=new DataView(profile.buffer);
+  assert(profile.length===3144&&view.getUint32(0)===profile.length&&profile[8]===2,'ICC size/version');
+  assert(utf8.decode(profile.subarray(16,24))==='RGB XYZ '&&utf8.decode(profile.subarray(36,40))==='acsp','ICC RGB/PCS/signature');
+  let description;
+  for(let i=0;i<view.getUint32(128);++i){
+    const entry=132+i*12;
+    if(utf8.decode(profile.subarray(entry,entry+4))==='desc'){
+      const offset=view.getUint32(entry+4),length=view.getUint32(offset+8);
+      assert(utf8.decode(profile.subarray(offset,offset+4))==='desc'&&profile[offset+12+length-1]===0,'ICC description tag');
+      description=utf8.decode(profile.subarray(offset+12,offset+12+length-1));
+    }
+  }
+  assert(description==='sRGB IEC61966-2.1','ICC internal description differs from assigned profile');
+  const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',profile)),byte=>byte.toString(16).padStart(2,'0')).join('');
+  assert(digest==='2b3aa1645779a9e634744faf9b01e9102b0c9b88fd6deced7934df86b949af7e','Embedded ICC bytes changed');
+  const gamma=chunks.find(chunk=>chunk.type==='gAMA').data,chroma=chunks.find(chunk=>chunk.type==='cHRM').data;
+  assert(gamma.length===4&&new DataView(gamma.buffer,gamma.byteOffset,4).getUint32(0)===45455,'sRGB fallback gamma');
+  const cv=new DataView(chroma.buffer,chroma.byteOffset,chroma.byteLength);
+  assert(chroma.length===32&&[31270,32900,64000,33000,30000,60000,15000,6000].every((value,i)=>cv.getUint32(i*4)===value),'sRGB fallback chromaticities');
+}
 function pattern(x,y,c){return c===0?x&255:c===1?y&255:c===2?(x*13+y*7)&255:255;}
 function pixels(w,h,startX=0,startY=0,buffer){
   const output=new Uint8Array(buffer||new ArrayBuffer(w*h*4),0,w*h*4);
   for(let y=0;y<h;++y)for(let x=0;x<w;++x)for(let c=0;c<4;++c)output[(y*w+x)*4+c]=pattern(startX+x,startY+y,c);
   return output;
 }
-async function validate(blob,width,height){
+async function validate(blob,width,height,renderView){
   const bytes=new Uint8Array(await blob.arrayBuffer()),view=new DataView(bytes.buffer);
   assert(bytes.slice(0,8).join(',')==='137,80,78,71,13,10,26,10','PNG signature');
+  const chunks=[];
   for(let offset=8;offset<bytes.length;){
-    const length=view.getUint32(offset);let crc=0xffffffff;
+    assert(offset+12<=bytes.length,'Truncated PNG chunk');
+    const length=view.getUint32(offset);assert(offset+length+12<=bytes.length,'PNG chunk bounds');let crc=0xffffffff;
     for(let i=offset+4;i<offset+8+length;++i){crc^=bytes[i];for(let bit=0;bit<8;++bit)crc=crc&1?(crc>>>1)^0xedb88320:crc>>>1;}
-    assert(((crc^0xffffffff)>>>0)===view.getUint32(offset+8+length),'PNG chunk CRC');offset+=length+12;
+    assert(((crc^0xffffffff)>>>0)===view.getUint32(offset+8+length),'PNG chunk CRC');
+    chunks.push({type:utf8.decode(bytes.subarray(offset+4,offset+8)),data:bytes.subarray(offset+8,offset+8+length)});offset+=length+12;
+  }
+  assert(chunks.slice(0,10).map(chunk=>chunk.type).join(',')==='IHDR,iCCP,gAMA,cHRM,tEXt,tEXt,tEXt,iTXt,iTXt,eXIf','PNG metadata order');
+  assert(chunks.at(-1).type==='IEND'&&chunks.at(-1).data.length===0&&chunks.length>=12,'PNG termination');
+  assert(chunks.slice(10,-1).every(chunk=>chunk.type==='IDAT'),'PNG IDAT continuity/metadata multiplicity');
+  const header=chunks[0].data;
+  assert(header.length===13&&view.getUint32(16)===width&&view.getUint32(20)===height&&header.slice(8).join(',')==='8,6,0,0,0','PNG IHDR');
+  const texts=new Map();
+  for(const chunk of chunks.filter(chunk=>chunk.type==='tEXt'||chunk.type==='iTXt')){
+    const zero=chunk.data.indexOf(0),keyword=utf8.decode(chunk.data.subarray(0,zero));assert(zero>0&&!texts.has(keyword),'Text keyword');
+    const start=zero+(chunk.type==='iTXt'?5:1);
+    if(chunk.type==='iTXt')assert(chunk.data.subarray(zero,zero+5).every(byte=>byte===0),'iTXt compression/language/translation');
+    texts.set(keyword,utf8.decode(chunk.data.subarray(start)));
+  }
+  const metadata=JSON.parse(texts.get('Mandelbrot.Metadata'));assertMetadata(metadata,renderView,width,height);
+  for(const [keyword,key]of [['Mandelbrot.CenterX','center_x'],['Mandelbrot.CenterY','center_y'],['Mandelbrot.ZoomExponent','zoom_exponent']])
+    assert(texts.get(keyword)===metadata[key],`tEXt ${key} disagrees`);
+  const xmp=new DOMParser().parseFromString(texts.get('XML:com.adobe.xmp'),'application/xml');
+  assert(!xmp.querySelector('parsererror'),'Malformed XMP');
+  Object.entries(metadata).forEach(([key,value],i)=>{
+    const nodes=xmp.getElementsByTagNameNS(xmpNamespace,xmpFields[i]);
+    assert(nodes.length===1&&nodes[0].textContent===String(value),`XMP ${key} disagrees`);
+    assert(!nodes[0].hasAttributeNS('http://www.w3.org/1999/02/22-rdf-syntax-ns#','datatype'),'XMP coordinates must remain text');
+  });
+  validateExif(chunks[9].data,metadata);await validateProfile(chunks);
+  // Verify raw sample bytes separately from the browser's colour management.
+  const raw=await inflate(await new Blob(chunks.filter(chunk=>chunk.type==='IDAT').map(chunk=>chunk.data)).arrayBuffer());
+  assert(raw.length===(width*4+1)*height,'PNG scanline size');
+  for(let y=0;y<height;++y){
+    assert(raw[y*(width*4+1)]===0,'PNG scanline filter');
+    for(let x=0;x<width;++x)for(let c=0;c<4;++c)
+      assert(raw[y*(width*4+1)+1+x*4+c]===pattern(x,y,c),`Raw PNG byte ${x},${y},${c}`);
   }
   const bitmap=await createImageBitmap(blob),canvas=document.createElement('canvas');
   canvas.width=width;canvas.height=height;const context=canvas.getContext('2d');context.drawImage(bitmap,0,0);bitmap.close();
@@ -33,7 +146,7 @@ async function validate(blob,width,height){
     assert(actual[(y*width+x)*4+c]===pattern(x,y,c),`PNG byte ${x},${y},${c}`);
   canvas.width=0;
 }
-async function workerCheck(width,height,compression){
+async function workerCheck(width,height,compression,renderView=testView()){
   let allocations=0,returns=0;
   const result=await new Promise((resolve,reject)=>{
     const worker=new Worker(new URL('png-worker.js',releaseBase),{type:'module'});
@@ -51,7 +164,7 @@ async function workerCheck(width,height,compression){
       worker.postMessage({type:'band',y:data.y,height:data.height,buffer},[buffer]);
       assert(buffer.byteLength===0,'RGBA strip was cloned instead of transferred');
     }catch(error){finish(error);}};
-    worker.postMessage({type:'init',width,height,compression});
+    worker.postMessage({type:'init',width,height,compression,metadata:createPngMetadata({view:renderView,width,height})});
   });
   assert(allocations===1,'More than one transfer buffer allocated');
   assert(returns===Math.ceil(height/32)-1,'A strip buffer was not returned');
@@ -59,8 +172,9 @@ async function workerCheck(width,height,compression){
   assert(result.metrics.filterBufferBytes===(width*4+1)*Math.min(32,height),'Filter workspace is not bounded');
   assert(result.metrics.inputBytes===width*height*4,'Incorrect encoder input byte accounting');
   assert(result.metrics.chunkBytes===result.blob.size,'Incorrect PNG byte accounting');
-  await validate(result.blob,width,height);
-  log(`PASS ${compression}: ${width}x${height}, every RGBA byte and CRC, one transfer buffer and one filter buffer.`);
+  assert(result.metrics.compression===compression,'Requested compression path was not exercised');
+  await validate(result.blob,width,height,renderView);
+  log(`PASS ${compression}: ${width}x${height}, zoom ${renderView.zoom}, exact metadata, XMP/EXIF, embedded sRGB, every RGBA byte and CRC, bounded buffers.`);
 }
 async function imageExportCheck(){
   const {createImageExport}=await import(new URL('image-export.js',releaseBase));
@@ -71,16 +185,19 @@ async function imageExportCheck(){
     context.putImageData(new ImageData(new Uint8ClampedArray(pixels(canvas.width,canvas.height,x,y).buffer),canvas.width,canvas.height),0,0);
     surfaces.set(`${x/1024},${y/1024}`,{context});layer.append(canvas);canvases.push(canvas);
   }
-  host.append(layer);const frame={width,height,layer,surfaces},exporter=createImageExport(host,candidate=>candidate===frame);
+  const renderView=testView(40.125);
+  host.append(layer);const frame={width,height,layer,surfaces,view:renderView},exporter=createImageExport(host,candidate=>candidate===frame);
   const completed=new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('Image export timed out')),15000);
     host.addEventListener('mandelbrot-export',event=>{clearTimeout(timer);resolve(event.detail);},{once:true});});
-  exporter.prepare(frame);const detail=await completed;
+  exporter.prepare(frame);
+  // A newer navigation view must never replace the snapshot of these pixels.
+  frame.view=testView(1600.25);const detail=await completed;
   assert(detail.transferBufferAllocations===1,'Image exporter did not recycle strips');
   assert(detail.readbackCalls===Math.ceil(width/1024)*Math.ceil(height/32),'Readback count');
   assert(detail.readbackBytes===width*height*4,'Readback byte count');
   assert(detail.encoder.inputBytes===detail.readbackBytes,'Pixels were dropped between canvas and encoder');
   assert(surfaces.size===0&&canvases.every(canvas=>canvas.width===0&&!canvas.isConnected),'Canvas backing stores not released');
-  const image=layer.querySelector('img'),response=await fetch(image.src);await validate(await response.blob(),width,height);
+  const image=layer.querySelector('img'),response=await fetch(image.src);await validate(await response.blob(),width,height,renderView);
   const menu=new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2});
   assert(image.dispatchEvent(menu)&&!menu.defaultPrevented,'Native image menu was prevented');
   const url=image.src;layer.remove();await delay(0);let revoked=false;try{await fetch(url);}catch{revoked=true;}
@@ -116,6 +233,12 @@ async function verificationCheck(){
   assert(repaired.every(value=>value.ready),'Repair did not verify the complete package');
   assert(fetches===resources.length+1,'Concurrent repairs duplicated the download');
   entries.delete(missing);assert(!(await message('status')).ready,'Later status permanently cached ready=true');
+  for(const name of ['png-metadata.js','srgb-profile.js']){
+    assert(api.REQUIRED.includes(name),'New module is not required offline');
+    const url=new URL(`releases/${api.RELEASE}/${name}`,api.BASE).href;entries.delete(url);
+    assert(!await api.complete(),`Offline verification ignored missing ${name}`);
+    assert((await message('repair')).ready,`Offline repair did not restore ${name}`);
+  }
   log('PASS offline verification: shared concurrent scan, later eviction detection, shared repair, fresh post-repair verification.');
 }
 button.onclick=async()=>{
@@ -124,7 +247,10 @@ button.onclick=async()=>{
     const response=await fetch(new URL('service-worker.js',source));assert(response.ok,'Missing service-worker source');serviceText=await response.text();
     const release=/const RELEASE = '([^']+)'/.exec(serviceText)?.[1];assert(release,'Missing release');
     releaseBase=new URL(release==='__RELEASE__'?'./':`releases/${release}/`,source);
+    ({createPngMetadata}=await import(new URL('png-metadata.js',releaseBase)));
+    ({createView,fixedDecimal}=await import(new URL('view.js',releaseBase)));
     for(const compression of ['deflate','store'])for(const [w,h]of[[1,1],[137,32],[137,73],[513,65]])await workerCheck(w,h,compression);
+    for(const compression of ['deflate','store'])for(const zoom of [5.125,1600.25,4000])await workerCheck(17,33,compression,testView(zoom));
     await imageExportCheck();await verificationCheck();document.body.dataset.state='complete';log('ALL CHECKS PASSED');
   }catch(error){document.body.dataset.state='failed';log(`FAIL: ${error.stack||error.message}`);}finally{button.disabled=false;}
 };
