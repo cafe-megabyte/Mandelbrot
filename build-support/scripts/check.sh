@@ -13,6 +13,7 @@ INTERNAL="$PWD/build/internal"
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/png-metadata-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/symmetry-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/resize-scheduler-check.js
+"$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/navigation-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/tile-queue-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/worker-check.js
 "$INTERNAL/host-tools/js-runner" "$INTERNAL/wasm/engine-simd.wasm" tests/worker-wasm-check.js

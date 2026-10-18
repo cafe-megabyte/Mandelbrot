@@ -1,6 +1,6 @@
 # Development notes
 
-Updated 17 October 2026. Keep this file brief; generated reports belong in
+Updated 18 October 2026. Keep this file brief; generated reports belong in
 `build/internal/`, not in `docs/`.
 
 ## Current state
@@ -26,6 +26,11 @@ Updated 17 October 2026. Keep this file brief; generated reports belong in
   above coarse previews, including when a preview times out or is black. Frozen
   staging stores and queued bytes are released; older backgrounds are compacted
   so only one accurate fallback remains. Browser regression: `partial-zoom.html`.
+- Safari trackpad gestures cancel overlapping wheel events and settle after
+  150 ms idle even without `gestureend`. A continued gesture retains its cumulative
+  scale and observes its starting element even after preview replacement;
+  completion outside the image or on window blur releases the final render.
+  Regression checks: `navigation-check.js` and browser `zoom.html`.
 - The numerical core remains the original baseline. An exact-centre experiment
   was reverted: it exposed broader existing coordinate/colour issues.
   Numerical repairs require separate scope.

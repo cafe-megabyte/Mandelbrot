@@ -14,6 +14,11 @@ function completed(action,timeout=300000){return new Promise((resolve,reject)=>{
   function listener(event){if(event.detail.phase!=='final')return;clearTimeout(timer);host.removeEventListener('mandelbrot-frame',listener);resolve({...event.detail,requestMilliseconds:performance.now()-started});}
   host.addEventListener('mandelbrot-frame',listener);action?.();
 });}
+function safariGesture(target,type,scale,rect){
+  const event=new Event(type,{cancelable:true,bubbles:true});
+  Object.assign(event,{scale,clientX:rect.left+rect.width/2,clientY:rect.top+rect.height/2});
+  target.dispatchEvent(event);return event;
+}
 async function exported(){for(let j=0;j<6000;++j){const image=host.querySelector('img.export-image');if(image&&host.dataset.exportState==='ready')return image;await delay(10);}throw new Error('PNG timed out');}
 async function verifyShallow(){
   const image=await exported(),view=app.getView(),width=image.naturalWidth,height=image.naturalHeight;
@@ -62,6 +67,36 @@ document.getElementById('check').onclick=async()=>{try{
   await completed(()=>app.reset());
   assert(location.hash==='' && app.getView().zoom===0,'Reset did not clear view URL');
   log('PASS: URL startup, wheel/pinch URL updates, reset, back/forward and stable history length.');
+  await completed(()=>app.setView({real:'-0.75',imag:'0.1',zoom:7}));
+  const safariBefore=app.getView();
+  await completed(()=>{
+    safariGesture(host,'gesturestart',1,rectangle);
+    safariGesture(host,'gesturechange',2,rectangle);
+    const wheel=new WheelEvent('wheel',{clientX:rectangle.left+230,clientY:rectangle.top+140,
+      deltaY:-80,ctrlKey:true,cancelable:true,bubbles:true});
+    host.dispatchEvent(wheel);assert(wheel.defaultPrevented,'Safari pinch left native page zoom enabled');
+    assert(safariGesture(document.body,'gestureend',2,rectangle).defaultPrevented,'Retargeted Safari completion was missed');
+  },30000);
+  assert(app.getView().zoom===safariBefore.zoom+1,'Safari pinch was applied twice');await verifyShallow();
+  const interrupted=app.getView();
+  await completed(()=>{
+    safariGesture(host,'gesturestart',1,rectangle);
+    safariGesture(host,'gesturechange',2,rectangle);
+    // No gestureend: the accurate frame must still replace the enlarged preview.
+  },30000);
+  assert(app.getView().zoom===interrupted.zoom+1 && host.dataset.state==='complete','Interrupted Safari pinch stayed on the preview');
+  await verifyShallow();
+  await completed(()=>safariGesture(document.body,'gesturechange',4,rectangle),30000);
+  assert(app.getView().zoom===interrupted.zoom+2,'Resuming Safari pinch repeated its cumulative scale');
+  safariGesture(document.body,'gestureend',4,rectangle);await verifyShallow();
+  const replaced=app.getView(),target=await exported();
+  await completed(()=>{
+    safariGesture(target,'gesturestart',1,rectangle);target.remove();
+    assert(safariGesture(target,'gesturechange',2,rectangle).defaultPrevented,'Detached Safari target enabled browser zoom');
+    safariGesture(target,'gestureend',2,rectangle);
+  },30000);
+  assert(app.getView().zoom===replaced.zoom+1,'Replacing the PNG interrupted Safari pinch');await verifyShallow();
+  log('PASS: Safari gesture/wheel overlap, replaced/retargeted elements, missing completion and cumulative scale after idle; final PNGs match scalar WASM.');
   const deep=await completed(()=>app.setView({real:'0',imag:'1',zoom:400}));
   assert(deep.deep && deep.skippedIterations>0,'Deep acceleration failed');log({check:'deep zoom',...deep});
   await exported();const at=app.getView();
