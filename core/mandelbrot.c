@@ -202,46 +202,120 @@ static inline uint32_t scalar_pixel(double cr, double ci) {
 }
 
 #if defined(__wasm_simd128__)
-/* Adjacent pixels share a vector orbit until the FIRST escape. Continuing the
- * remaining lane scalarly avoids per-iteration lane counters, masking, frozen
- * state and wasted work on an already escaped pixel. */
-static inline void pixel_pair(double cr0, double cr1, double ci, uint32_t *dst) {
-    int inside0 = known_interior(cr0, ci), inside1 = known_interior(cr1, ci);
-    if (inside0 | inside1) {
-        dst[0] = inside0 ? UINT32_C(0xff000000) : finish_orbit(cr0, ci, 0, 0, 0, 0, 0);
-        dst[1] = inside1 ? UINT32_C(0xff000000) : finish_orbit(cr1, ci, 0, 0, 0, 0, 0);
-        return;
-    }
-    v128_t cx = wasm_f64x2_make(cr0, cr1), cy = wasm_f64x2_splat(ci);
-    v128_t x = wasm_f64x2_splat(0), y = x, xx = x, yy = x;
-    const v128_t four = wasm_f64x2_splat(4.0);
-    v128_t checkpoint_x = x, checkpoint_y = y;
-    unsigned checkpoint_span = 16, next_checkpoint = 16;
-    unsigned n = 0, escaped;
-    do {
-        unsigned end = n + 16 < limit ? n + 16 : limit;
-        do {
-            y = wasm_f64x2_add(wasm_f64x2_mul(wasm_f64x2_add(x, x), y), cy);
-            x = wasm_f64x2_add(wasm_f64x2_sub(xx, yy), cx);
-            xx = wasm_f64x2_mul(x, x); yy = wasm_f64x2_mul(y, y);
-            ++n;
-            escaped = wasm_i64x2_bitmask(wasm_f64x2_gt(wasm_f64x2_add(xx, yy), four));
-        } while (!escaped && n < end);
-        if (escaped || n == limit) break;
-        v128_t repeated = wasm_v128_and(wasm_f64x2_eq(x, checkpoint_x), wasm_f64x2_eq(y, checkpoint_y));
-        if (wasm_i64x2_bitmask(repeated) == 3) { dst[0] = dst[1] = UINT32_C(0xff000000); return; }
-        if (n == next_checkpoint) {
-            checkpoint_x = x; checkpoint_y = y;
-            checkpoint_span *= 2; next_checkpoint = n + checkpoint_span;
+/* Four pixels stream through two independent f64x2 orbits. Each lane performs
+ * exactly the scalar operation sequence of finish_orbit (no contraction), so
+ * every escape iteration and magnitude is bit-identical. The second vector
+ * hides floating-point latency; a lane that escapes, reaches the limit or
+ * repeats its exact state is refilled with the tile's next pixel instead of
+ * finishing its partner lane scalarly. Exact state repetition proves a cycle
+ * of this deterministic orbit, so the checkpoint schedule cannot change any
+ * result, only how early a periodic pixel stops. Idle lanes iterate c=0. */
+#ifndef STREAM_PREFIX
+#define STREAM_PREFIX 4
+#endif
+static inline v128_t lane_set(v128_t v, unsigned lane, double value) {
+    return lane ? wasm_f64x2_replace_lane(v, 1, value) : wasm_f64x2_replace_lane(v, 0, value);
+}
+static void render_stream(unsigned tx, unsigned ty, unsigned width, unsigned height) {
+    const v128_t four = wasm_f64x2_splat(4.0), zero = wasm_f64x2_splat(0.0);
+    v128_t cx0 = zero, cx1 = zero, cy0 = zero, cy1 = zero, x0 = zero, x1 = zero, y0 = zero, y1 = zero;
+    v128_t xx0 = zero, xx1 = zero, yy0 = zero, yy1 = zero, kx0 = zero, kx1 = zero, ky0 = zero, ky1 = zero;
+    uint64_t tick = 1024, start[4] = {0}, next_check[4] = {0}, span[4] = {0};
+    unsigned index[4] = {0}, active = 0, refill = 15, total = width * height, next = 0, row = 0, col = 0;
+    double ci = centre_imag + (half_height - ((double)ty + 0.5)) * step;
+    for (;;) {
+        /* Load the next non-interior pixels into every lane marked for refill. */
+        for (unsigned lane = 0; refill; ++lane) {
+            if (!(refill & (1u << lane))) continue;
+            refill &= ~(1u << lane);
+            double cr = 0, ci_lane = 0, sx = 0, sy = 0, sxx = 0, syy = 0;
+            active &= ~(1u << lane);
+            while (next < total) {
+                unsigned pixel = next++;
+                double r = centre_real + (((double)(tx + col) + 0.5) - half_width) * step, i = ci;
+                if (++col == width) { col = 0; ++row; ci = centre_imag + (half_height - ((double)(ty + row) + 0.5)) * step; }
+                if (known_interior(r, i)) { output[pixel] = UINT32_C(0xff000000); continue; }
+                /* Short orbits finish in the identical scalar sequence; only
+                   longer ones occupy a lane, avoiding a stop per early escape.
+                   Four iterations measured best (overview to zoom 2^-24). */
+                double px = 0, py = 0, pxx = 0, pyy = 0;
+                unsigned n = 0, prefix = limit < STREAM_PREFIX ? limit : STREAM_PREFIX;
+                do {
+                    py = (px + px) * py + i;
+                    px = pxx - pyy + r;
+                    pxx = px * px; pyy = py * py;
+                    ++n;
+                } while (n < prefix && pxx + pyy <= 4.0);
+                if (pxx + pyy > 4.0) { output[pixel] = colour(n, pxx + pyy); continue; }
+                if (n == limit) { output[pixel] = UINT32_C(0xff000000); continue; }
+                cr = r; ci_lane = i; index[lane] = pixel; active |= 1u << lane;
+                start[lane] = tick - n; next_check[lane] = 16; span[lane] = 16;
+                sx = px; sy = py; sxx = pxx; syy = pyy;
+                break;
+            }
+            unsigned half = lane & 1;
+            if (lane < 2) {
+                cx0 = lane_set(cx0, half, cr); cy0 = lane_set(cy0, half, ci_lane);
+                x0 = lane_set(x0, half, sx); y0 = lane_set(y0, half, sy);
+                xx0 = lane_set(xx0, half, sxx); yy0 = lane_set(yy0, half, syy);
+                kx0 = lane_set(kx0, half, 0); ky0 = lane_set(ky0, half, 0);
+            } else {
+                cx1 = lane_set(cx1, half, cr); cy1 = lane_set(cy1, half, ci_lane);
+                x1 = lane_set(x1, half, sx); y1 = lane_set(y1, half, sy);
+                xx1 = lane_set(xx1, half, sxx); yy1 = lane_set(yy1, half, syy);
+                kx1 = lane_set(kx1, half, 0); ky1 = lane_set(ky1, half, 0);
+            }
         }
-    } while (!escaped && n < limit);
-    if (n == limit) { dst[0] = dst[1] = UINT32_C(0xff000000); return; }
-    double x0 = wasm_f64x2_extract_lane(x, 0), x1 = wasm_f64x2_extract_lane(x, 1);
-    double y0 = wasm_f64x2_extract_lane(y, 0), y1 = wasm_f64x2_extract_lane(y, 1);
-    double xx0 = wasm_f64x2_extract_lane(xx, 0), xx1 = wasm_f64x2_extract_lane(xx, 1);
-    double yy0 = wasm_f64x2_extract_lane(yy, 0), yy1 = wasm_f64x2_extract_lane(yy, 1);
-    dst[0] = (escaped & 1) ? colour(n, xx0 + yy0) : finish_orbit(cr0, ci, x0, y0, xx0, yy0, n);
-    dst[1] = (escaped & 2) ? colour(n, xx1 + yy1) : finish_orbit(cr1, ci, x1, y1, xx1, yy1, n);
+        if (!active) return;
+        /* Run to the next 16-step boundary, the earliest lane limit or an escape. */
+        uint64_t end = (tick | 15) + 1;
+        for (unsigned lane = 0; lane < 4; ++lane)
+            if ((active & (1u << lane)) && start[lane] + limit < end) end = start[lane] + limit;
+        unsigned escaped;
+        do {
+            y0 = wasm_f64x2_add(wasm_f64x2_mul(wasm_f64x2_add(x0, x0), y0), cy0);
+            y1 = wasm_f64x2_add(wasm_f64x2_mul(wasm_f64x2_add(x1, x1), y1), cy1);
+            x0 = wasm_f64x2_add(wasm_f64x2_sub(xx0, yy0), cx0);
+            x1 = wasm_f64x2_add(wasm_f64x2_sub(xx1, yy1), cx1);
+            xx0 = wasm_f64x2_mul(x0, x0); yy0 = wasm_f64x2_mul(y0, y0);
+            xx1 = wasm_f64x2_mul(x1, x1); yy1 = wasm_f64x2_mul(y1, y1);
+            ++tick;
+            escaped = wasm_i64x2_bitmask(wasm_f64x2_gt(wasm_f64x2_add(xx0, yy0), four)) |
+                      wasm_i64x2_bitmask(wasm_f64x2_gt(wasm_f64x2_add(xx1, yy1), four)) << 2;
+        } while (!(escaped & active) && tick < end);
+        double magnitude[4];
+        wasm_v128_store(magnitude, wasm_f64x2_add(xx0, yy0));
+        wasm_v128_store(magnitude + 2, wasm_f64x2_add(xx1, yy1));
+        unsigned finished = 0;
+        for (unsigned lane = 0; lane < 4; ++lane) {
+            if (!(active & (1u << lane))) continue;
+            uint64_t n = tick - start[lane];
+            if (escaped & (1u << lane)) { output[index[lane]] = colour((unsigned)n, magnitude[lane]); finished |= 1u << lane; }
+            else if (n == limit) { output[index[lane]] = UINT32_C(0xff000000); finished |= 1u << lane; }
+        }
+        if (!(tick & 15)) {
+            unsigned repeated = wasm_i64x2_bitmask(wasm_v128_and(wasm_f64x2_eq(x0, kx0), wasm_f64x2_eq(y0, ky0))) |
+                wasm_i64x2_bitmask(wasm_v128_and(wasm_f64x2_eq(x1, kx1), wasm_f64x2_eq(y1, ky1))) << 2;
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                unsigned bit = 1u << lane;
+                if (!(active & bit) || (finished & bit)) continue;
+                uint64_t n = tick - start[lane];
+                if (repeated & bit) { output[index[lane]] = UINT32_C(0xff000000); finished |= bit; continue; }
+                if (n >= next_check[lane]) {
+                    unsigned half = lane & 1;
+                    if (lane < 2) {
+                        kx0 = lane_set(kx0, half, half ? wasm_f64x2_extract_lane(x0, 1) : wasm_f64x2_extract_lane(x0, 0));
+                        ky0 = lane_set(ky0, half, half ? wasm_f64x2_extract_lane(y0, 1) : wasm_f64x2_extract_lane(y0, 0));
+                    } else {
+                        kx1 = lane_set(kx1, half, half ? wasm_f64x2_extract_lane(x1, 1) : wasm_f64x2_extract_lane(x1, 0));
+                        ky1 = lane_set(ky1, half, half ? wasm_f64x2_extract_lane(y1, 1) : wasm_f64x2_extract_lane(y1, 0));
+                    }
+                    span[lane] *= 2; next_check[lane] = n + span[lane];
+                }
+            }
+        }
+        refill = finished;
+    }
 }
 #endif
 
@@ -249,21 +323,18 @@ unsigned render_tile(unsigned tx, unsigned ty, unsigned width, unsigned height) 
     if (!frame_width || !width || !height || width > MANDELBROT_TILE_WIDTH ||
         height > MANDELBROT_TILE_HEIGHT || width > frame_width || height > frame_height ||
         tx > frame_width - width || ty > frame_height - height) return 0;
+#if defined(__wasm_simd128__)
+    render_stream(tx, ty, width, height);
+#else
     uint32_t *dst = output;
     for (unsigned row = 0; row < height; ++row) {
         double ci = centre_imag + (half_height - ((double)(ty + row) + 0.5)) * step;
         unsigned col = 0;
-#if defined(__wasm_simd128__)
-        for (; col + 1 < width; col += 2) {
-            double cr0 = centre_real + (((double)(tx + col) + 0.5) - half_width) * step;
-            double cr1 = centre_real + (((double)(tx + col + 1) + 0.5) - half_width) * step;
-            pixel_pair(cr0, cr1, ci, dst); dst += 2;
-        }
-#endif
         for (; col < width; ++col) {
             double cr = centre_real + (((double)(tx + col) + 0.5) - half_width) * step;
             *dst++ = scalar_pixel(cr, ci);
         }
     }
+#endif
     return width * height * 4u;
 }

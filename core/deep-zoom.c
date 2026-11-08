@@ -235,84 +235,120 @@ static int sum_big(uint32_t *out,const uint32_t *a,int sa,const uint32_t *b,int 
     for(unsigned j=0;j<digits;++j){uint64_t av=a[j],bv=(uint64_t)b[j]+borrow;out[j]=(uint32_t)(av-bv);borrow=av<bv;}
     return sa;
 }
-static void multiply_words(uint32_t *out,const uint32_t *a,const uint32_t *b,unsigned n,uint32_t *work){
-    if(n<32 || (n&1)){
-        for(unsigned j=0;j<2*n;++j)out[j]=0;
-        for(unsigned j=0;j<n;++j){
-            uint64_t carry=0;
-            for(unsigned k=0;k<n;++k){uint64_t value=(uint64_t)a[j]*b[k]+out[j+k]+carry;out[j+k]=(uint32_t)value;carry=value>>32;}
-            out[j+n]=(uint32_t)carry;
-        }
-        return;
-    }
-    unsigned half=n/2;int as=1,bs=1;
-    for(unsigned j=half;j--;)if(a[half+j]!=a[j]){as=a[half+j]>a[j]?1:-1;break;}
-    for(unsigned j=half;j--;)if(b[j]!=b[half+j]){bs=b[j]>b[half+j]?1:-1;break;}
-    uint64_t borrow_a=0,borrow_b=0;
-    for(unsigned j=0;j<half;++j){
-        uint64_t av=as>0?a[half+j]:a[j],bv=(uint64_t)(as>0?a[j]:a[half+j])+borrow_a;
-        work[j]=(uint32_t)(av-bv);borrow_a=av<bv;
-        av=bs>0?b[j]:b[half+j];bv=(uint64_t)(bs>0?b[half+j]:b[j])+borrow_b;
-        work[half+j]=(uint32_t)(av-bv);borrow_b=av<bv;
-    }
-    /* Compute the signed difference product first, temporarily in the middle
-       of the output. Retain it in the first half of the existing workspace;
-       the second half is enough scratch for both recursive half products. */
-    multiply_words(out+half,work,work+half,half,work+n);
-    for(unsigned j=0;j<n;++j)work[j]=out[half+j];
-    multiply_words(out,a,b,half,work+n);
-    multiply_words(out+n,a+half,b+half,half,work+n);
-    int64_t carry=0;
+static void multiply_school(uint32_t *out,const uint32_t *a,const uint32_t *b,unsigned n){
+    for(unsigned j=0;j<2*n;++j)out[j]=0;
     for(unsigned j=0;j<n;++j){
-        int64_t value=(int64_t)out[j]+out[n+j]+(as==bs?(int64_t)work[j]:-(int64_t)work[j])+carry;
-        work[n+j]=(uint32_t)value;carry=value<0?-1:value>>32;
-    }
-    uint64_t addition=0;
-    for(unsigned j=0;j<n;++j){uint64_t value=(uint64_t)out[half+j]+work[n+j]+addition;out[half+j]=(uint32_t)value;addition=value>>32;}
-    addition+=(uint64_t)carry;
-    for(unsigned j=half+n;addition && j<2*n;++j){addition+=out[j];out[j]=(uint32_t)addition;addition>>=32;}
-}
-static void multiply_big(uint32_t *out,const uint32_t *a,const uint32_t *b) {
-    if((deep_options&DEEP_KARATSUBA) && digits>=32 && !(digits&1)){
-        /* scratch[4:6] is dead during orbit multiplication: fixed_pixel has
-           already copied its coordinate into scratch[6] and scratch[7]. */
-        multiply_words(product,a,b,digits,scratch[4]);
-    }else{
-    for(unsigned j=0;j<2*digits;++j)product[j]=0;
-    for(unsigned j=0;j<digits;++j){
         uint64_t carry=0;
-        for(unsigned k=0;k<digits;++k){uint64_t v=(uint64_t)a[j]*b[k]+product[j+k]+carry;product[j+k]=(uint32_t)v;carry=v>>32;}
-        product[j+digits]=(uint32_t)carry;
+        for(unsigned k=0;k<n;++k){uint64_t value=(uint64_t)a[j]*b[k]+out[j+k]+carry;out[j+k]=(uint32_t)value;carry=value>>32;}
+        out[j+n]=(uint32_t)carry;
     }
-    }
-    for(unsigned j=0;j<digits;++j)out[j]=product[j+fraction];
-    for(unsigned j=0;j<fraction;++j)if(product[j]){rounded_product=1;break;}
 }
 /* Accumulate each off-diagonal product once, double the complete result, then
  * add the diagonal. All carries use at most 64 bits; unlike doubling a single
- * 32x32 product this never needs an overflowing 65-bit temporary. The existing
- * product workspace and exactly the same truncation rule are reused. */
-static void square_big(uint32_t *out,const uint32_t *a){
-    if(!(deep_options&DEEP_SQUARE)){multiply_big(out,a,a);return;}
-    for(unsigned j=0;j<2*digits;++j)product[j]=0;
-    for(unsigned j=0;j<digits;++j){
+ * 32x32 product this never needs an overflowing 65-bit temporary. */
+static void square_school(uint32_t *out,const uint32_t *a,unsigned n){
+    for(unsigned j=0;j<2*n;++j)out[j]=0;
+    for(unsigned j=0;j<n;++j){
         uint64_t carry=0;
-        for(unsigned k=j+1;k<digits;++k){
-            uint64_t value=(uint64_t)a[j]*a[k]+product[j+k]+carry;
-            product[j+k]=(uint32_t)value;carry=value>>32;
+        for(unsigned k=j+1;k<n;++k){
+            uint64_t value=(uint64_t)a[j]*a[k]+out[j+k]+carry;
+            out[j+k]=(uint32_t)value;carry=value>>32;
         }
-        product[j+digits]=(uint32_t)carry;
+        out[j+n]=(uint32_t)carry;
     }
     uint32_t bit=0;
-    for(unsigned j=0;j<2*digits;++j){uint32_t next=product[j]>>31;product[j]=(product[j]<<1)|bit;bit=next;}
+    for(unsigned j=0;j<2*n;++j){uint32_t next=out[j]>>31;out[j]=(out[j]<<1)|bit;bit=next;}
     uint64_t carry=0;
-    for(unsigned j=0;j<digits;++j){
+    for(unsigned j=0;j<n;++j){
         uint64_t diagonal=(uint64_t)a[j]*a[j];
-        uint64_t low=(uint64_t)product[2*j]+(uint32_t)diagonal+carry;
-        product[2*j]=(uint32_t)low;
-        uint64_t high=(uint64_t)product[2*j+1]+(diagonal>>32)+(low>>32);
-        product[2*j+1]=(uint32_t)high;carry=high>>32;
+        uint64_t low=(uint64_t)out[2*j]+(uint32_t)diagonal+carry;
+        out[2*j]=(uint32_t)low;
+        uint64_t high=(uint64_t)out[2*j+1]+(diagonal>>32)+(low>>32);
+        out[2*j+1]=(uint32_t)high;carry=high>>32;
     }
+}
+#ifndef KARATSUBA_MULTIPLY_MIN
+#define KARATSUBA_MULTIPLY_MIN 32
+#endif
+#ifndef KARATSUBA_SQUARE_MIN
+#define KARATSUBA_SQUARE_MIN 48
+#endif
+/* Exact Karatsuba recombination shared by products and squares. With
+ * l=floor(n/2), h=n-l, the low halves give z0 (2l limbs at out), the high halves
+ * z2 (2h limbs at out+2l), and work[0..2h) holds the magnitude p of the
+ * difference product. The cross term z0+z2+sign*p is exact and nonnegative;
+ * add it at limb l. Every value stays an exact integer, so the final 2n-limb
+ * result, its truncation and the rounded flag equal the schoolbook ones. */
+static void karatsuba_combine(uint32_t *out,uint32_t *work,unsigned n,int subtract){
+    unsigned l=n/2,h=n-l;
+    int64_t carry=0;
+    for(unsigned j=0;j<2*h;++j){
+        int64_t value=(int64_t)(j<2*l?out[j]:0)+out[2*l+j]+(subtract?-(int64_t)work[j]:(int64_t)work[j])+carry;
+        work[j]=(uint32_t)value;carry=value<0?-1:value>>32;
+    }
+    uint64_t addition=0;
+    for(unsigned j=0;j<2*h;++j){uint64_t value=(uint64_t)out[l+j]+work[j]+addition;out[l+j]=(uint32_t)value;addition=value>>32;}
+    addition+=(uint64_t)carry;
+    for(unsigned j=l+2*h;addition && j<2*n;++j){addition+=out[j];out[j]=(uint32_t)addition;addition>>=32;}
+}
+/* Measured V8/WASM crossovers: products gain from 32 limbs (24 is no faster),
+ * while the cheaper schoolbook square still wins below about 48 limbs.
+ * Workspace: 2h limbs for the difference product plus the recursion's own.
+ * deep-check proves this is at most 2n for every n up to the limit below;
+ * larger, impractical precisions keep the schoolbook products. */
+#define KARATSUBA_MAX_LIMBS (1u<<20)
+static void multiply_words(uint32_t *out,const uint32_t *a,const uint32_t *b,unsigned n,uint32_t *work){
+    if(n<KARATSUBA_MULTIPLY_MIN){multiply_school(out,a,b,n);return;}
+    unsigned l=n/2,h=n-l;
+    /* da=|a1-a0|, db=|b0-b1| with the low halves zero-extended to h limbs. */
+    int as=1,bs=1;
+    for(unsigned j=h;j--;){uint32_t low=j<l?a[j]:0;if(a[l+j]!=low){as=a[l+j]>low?1:-1;break;}}
+    for(unsigned j=h;j--;){uint32_t low=j<l?b[j]:0;if(low!=b[l+j]){bs=low>b[l+j]?1:-1;break;}}
+    uint64_t borrow_a=0,borrow_b=0;
+    for(unsigned j=0;j<h;++j){
+        uint64_t low=j<l?a[j]:0,high=a[l+j];
+        uint64_t av=as>0?high:low,bv=(as>0?low:high)+borrow_a;
+        work[j]=(uint32_t)(av-bv);borrow_a=av<bv;
+        low=j<l?b[j]:0;high=b[l+j];
+        av=bs>0?low:high;bv=(bs>0?high:low)+borrow_b;
+        work[h+j]=(uint32_t)(av-bv);borrow_b=av<bv;
+    }
+    /* The difference product temporarily uses the start of the output. */
+    multiply_words(out,work,work+h,h,work+2*h);
+    for(unsigned j=0;j<2*h;++j)work[j]=out[j];
+    multiply_words(out,a,b,l,work+2*h);
+    multiply_words(out+2*l,a+l,b+l,h,work+2*h);
+    karatsuba_combine(out,work,n,as!=bs);
+}
+static void square_words(uint32_t *out,const uint32_t *a,unsigned n,uint32_t *work){
+    if(n<KARATSUBA_SQUARE_MIN){square_school(out,a,n);return;}
+    unsigned l=n/2,h=n-l;
+    int as=1;
+    for(unsigned j=h;j--;){uint32_t low=j<l?a[j]:0;if(a[l+j]!=low){as=a[l+j]>low?1:-1;break;}}
+    uint64_t borrow=0;
+    for(unsigned j=0;j<h;++j){
+        uint64_t low=j<l?a[j]:0,high=a[l+j];
+        uint64_t av=as>0?high:low,bv=(as>0?low:high)+borrow;
+        work[j]=(uint32_t)(av-bv);borrow=av<bv;
+    }
+    square_words(out,work,h,work+h);
+    for(unsigned j=0;j<2*h;++j)work[j]=out[j];
+    square_words(out,a,l,work+2*h);
+    square_words(out+2*l,a+l,h,work+2*h);
+    karatsuba_combine(out,work,n,1);
+}
+/* scratch[4:6] is dead during orbit multiplication and squaring: fixed_pixel
+   has already copied its coordinate into scratch[6] and scratch[7]. */
+static void multiply_big(uint32_t *out,const uint32_t *a,const uint32_t *b) {
+    if((deep_options&DEEP_KARATSUBA) && digits>=KARATSUBA_MULTIPLY_MIN && digits<=KARATSUBA_MAX_LIMBS)multiply_words(product,a,b,digits,scratch[4]);
+    else multiply_school(product,a,b,digits);
+    for(unsigned j=0;j<digits;++j)out[j]=product[j+fraction];
+    for(unsigned j=0;j<fraction;++j)if(product[j]){rounded_product=1;break;}
+}
+static void square_big(uint32_t *out,const uint32_t *a){
+    if(!(deep_options&DEEP_SQUARE)){multiply_big(out,a,a);return;}
+    if((deep_options&DEEP_KARATSUBA) && digits>=KARATSUBA_SQUARE_MIN && digits<=KARATSUBA_MAX_LIMBS)square_words(product,a,digits,scratch[4]);
+    else square_school(product,a,digits);
     for(unsigned j=0;j<digits;++j)out[j]=product[j+fraction];
     for(unsigned j=0;j<fraction;++j)if(product[j]){rounded_product=1;break;}
 }
@@ -492,7 +528,10 @@ static inline __attribute__((always_inline)) uint32_t dd_pixel_impl(Extended dc,
     for(unsigned n=1;n<=limit;++n){
         DoubleDouble xx=cache?cached_xx:dd_multiply(x,x),yy=cache?cached_yy:dd_multiply(y,y),xy=dd_multiply(x,y);
         error=(2*norm+error)*error+0x1p-96*(xx.hi+yy.hi+absd(cr.hi)+absd(ci.hi));
-        x=dd_add(dd_add(xx,dd_negative(yy)),cr);y=dd_add(dd_add(xy,xy),ci);
+        /* xy is a normalized Fast2Sum result, so dd_add(xy,xy) is exactly
+           both components doubled (signed zeros aside, which never reach
+           a comparison or colour). */
+        x=dd_add(dd_add(xx,dd_negative(yy)),cr);y=dd_add((DoubleDouble){2*xy.hi,2*xy.lo},ci);
         cached_xx=dd_multiply(x,x);cached_yy=dd_multiply(y,y);
         DoubleDouble mag=dd_add(cached_xx,cached_yy);
         norm=__builtin_sqrt(x.hi*x.hi+y.hi*y.hi);
@@ -893,10 +932,16 @@ static int prepare_local_reference(unsigned tx,unsigned ty,unsigned width,unsign
             /* Replay the same fixed orbit only after the inexpensive black
              * proof has failed. deep_begin preserves the reference centre,
              * output and counters; both passes count as actual reference work. */
+            /* The replay recomputes bit-identical orbit and margin samples, so
+               it can stop as soon as the DD prefix is finished. Restore the
+               first pass's final orbit state; nothing after this reads limbs. */
+            unsigned first_count=deep_header->count,first_iteration=reference_iteration;
+            Extended first_error=reference_error;
             deep_begin(rs,is,spacing_extended.r,spacing_extended.e,width,height);
             prefix_dd_begin();
-            while(!deep_reference(128)){}
+            while(prefix_dd_active && !deep_reference(128)){}
             if(precision_needed)return 0;
+            deep_header->count=first_count;reference_iteration=first_iteration;reference_error=first_error;
         }
         deep_finish();
         dd_real=big_dd(cr_big,cr_sign);dd_imag=big_dd(ci_big,ci_sign);

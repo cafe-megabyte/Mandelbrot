@@ -147,6 +147,49 @@ static void check_karatsuba(void){
     }
     deep_set_options(saved);
 }
+static unsigned karatsuba_workspace(unsigned n,unsigned minimum){
+    if(n<minimum)return 0;
+    unsigned h=n-n/2;return 2*h+karatsuba_workspace(h,minimum);
+}
+/* Odd sizes and squares use the generalized split. Results must equal the
+ * schoolbook integers exactly, and the recursion must stay inside its 2n-limb
+ * workspace: scratch[6] and scratch[7] carry fixed_pixel's live coordinate. */
+static void check_karatsuba_general(void){
+    for(unsigned n=1;n<=KARATSUBA_MAX_LIMBS;++n)
+        require(karatsuba_workspace(n,KARATSUBA_MULTIPLY_MIN)<=2*n && karatsuba_workspace(n,KARATSUBA_SQUARE_MIN)<=2*n,
+            "Karatsuba workspace exceeds two limb blocks");
+    const unsigned sizes[]={23,24,25,31,32,33,34,35,47,48,49,63,64,65,66,97,107,108,109,128,129,200,255};unsigned saved=deep_options;
+    uint32_t random=0x5bd1e995u;
+    for(unsigned test=0;test<sizeof(sizes)/sizeof(sizes[0]);++test){
+        require(deep_allocate((sizes[test]-1)*32,32),"Generalized Karatsuba allocation failed");
+        require(digits==sizes[test],"Unexpected Karatsuba limb count");
+        uint32_t *expected=malloc(2*digits*sizeof(uint32_t)),*truncated=malloc(digits*sizeof(uint32_t));
+        require(expected && truncated,"Generalized Karatsuba fixture allocation failed");
+        for(unsigned sample=0;sample<120;++sample){
+            for(unsigned j=0;j<digits;++j){
+                random=random*1664525u+1013904223u;
+                cr_big[j]=sample==0?UINT32_MAX:sample==1?0:sample==2?(j<digits/2?0:UINT32_MAX):
+                    sample==3?(j<digits/2?UINT32_MAX:0):sample==4?(j==digits-1?1:0):random;
+                random=random*1664525u+1013904223u;
+                ci_big[j]=sample==0?UINT32_MAX:sample==2?(j<digits/2?UINT32_MAX:0):sample==3?0:random;
+            }
+            for(unsigned square=0;square<2;++square){
+                deep_set_options(saved&~DEEP_KARATSUBA);rounded_product=0;
+                if(square)square_big(truncated,cr_big);else multiply_big(truncated,cr_big,ci_big);
+                int rounded=rounded_product;memcpy(expected,product,2*digits*sizeof(uint32_t));
+                for(unsigned j=0;j<2*digits;++j)scratch[6][j]=0xa5a5a5a5u^j;
+                deep_set_options(saved|DEEP_KARATSUBA);rounded_product=0;
+                if(square)square_big(scratch[0],cr_big);else multiply_big(scratch[0],cr_big,ci_big);
+                for(unsigned j=0;j<2*digits;++j)require(scratch[6][j]==(0xa5a5a5a5u^j),"Karatsuba workspace overflow");
+                require(!memcmp(expected,product,2*digits*sizeof(uint32_t)),square?"Karatsuba square mismatch":"Odd Karatsuba product mismatch");
+                require(!memcmp(truncated,scratch[0],digits*sizeof(uint32_t)),"Generalized Karatsuba truncation mismatch");
+                require(rounded==rounded_product,"Generalized Karatsuba rounding flag mismatch");
+            }
+        }
+        free(expected);free(truncated);
+    }
+    deep_set_options(saved);
+}
 static void check_growth_and_resume(void){
     for(unsigned local=0;local<2;++local){
     prepare("0.0",1,"1.0",1,local?-40:-400,2048);
@@ -400,7 +443,11 @@ static void check_precise_series(void){
                     "Accurate prefix did not replace ordinary iterations");
                 require((prefix_dd_used!=0)==((variants[variant]&DEEP_PRECISE_SERIES)!=0 && w*h>=128),
                     "Accurate prefix chose the wrong arithmetic");
-                require(deep_header->count==before_count && deep_reference_iterations==before_reference*(prefix_dd_used?2:1),
+                /* The replay stops after its DD prefix: it adds some, but at most
+                   one more pass of, reference work and leaves the orbit intact. */
+                require(deep_header->count==before_count && (prefix_dd_used?
+                    deep_reference_iterations>before_reference && deep_reference_iterations<=2*before_reference:
+                    deep_reference_iterations==before_reference),
                     "Precise prefix replay changed the reference or hid its work");
                 if(variant==2)dd_prefix=series_start;
                 if(variant==3)require(series_start==dd_prefix,"Tight option overrode an already built DD prefix");
@@ -502,7 +549,7 @@ static void check_variants(void){
 int main(void){
     require(!deep_allocate(0,512),"Invalid precision accepted");
     require(!deep_allocate(0x7fffffbfu,0x7fffffbfu),"Workspace size overflow was accepted");
-    check_bla_pruning();check_local_reference_reuse();check_squares();check_karatsuba();check_growth_and_resume();check_rescaled_addition();check_exact_exponent_shifts();check_reference_coordinates();
+    check_bla_pruning();check_local_reference_reuse();check_squares();check_karatsuba();check_karatsuba_general();check_growth_and_resume();check_rescaled_addition();check_exact_exponent_shifts();check_reference_coordinates();
     check_big_conversion();check_adaptive_boundaries();check_analytic_deep_boundaries();check_black_certificates();check_precise_series();check_variants();
     prepare("0.743643887037151",-1,"0.13182590420533",1,-32,4096);
     unsigned comparisons=0;

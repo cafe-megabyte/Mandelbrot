@@ -1,6 +1,6 @@
 # Development notes
 
-Updated 18 October 2026. Keep this file brief; generated reports belong in
+Updated 8 November 2026. Keep this file brief; generated reports belong in
 `build/internal/`, not in `docs/`.
 
 ## Current state
@@ -51,6 +51,20 @@ Updated 18 October 2026. Keep this file brief; generated reports belong in
 - Exact cusp32 centre: bounded through 34365 iterations, first escape at 34366.
   A small derivative is not an interior proof.
 - No unverified fast-math, relaxed SIMD, FMA or loosened BLA tolerances.
+
+## November 2026 byte-identical speedups
+
+- Shallow SIMD: four pixels stream through two interleaved `f64x2` orbits; an
+  escaped, limit or cycled lane is refilled with the next pixel. Each pixel first
+  runs 4 identical scalar iterations (measured best of 1/4/8/16/32/64).
+- Limbs: Karatsuba also for odd limb counts (products from 32 limbs) and for
+  squares (from 48 limbs). Workspace is proved <=2n limbs up to 2^20 limbs.
+- The precise-series replay stops once its DD prefix ends; the orbit is unchanged.
+- Render workers: at most 16 (was 8), still one logical core fewer than reported.
+- Rejected, bit-identical but slower: `DEEP_DD_CACHE` (+2 to +10% in every DD
+  case despite fewer products); Karatsuba squares at 32-47 limbs (+11% at 33).
+- No Node? `build/internal/host-tools/js-runner` has no optimizing WASM tier
+  (about 14x slower); measure in a browser instead.
 
 ## Performance lessons
 

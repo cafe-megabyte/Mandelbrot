@@ -52,7 +52,9 @@ export async function start(root, options = {}) {
   const wasmBytes = backend === 'simd128' ? simdBytes : await loadBytes('engine-scalar.wasm');
   const module = await WebAssembly.compile(wasmBytes);
   if (WebAssembly.Module.imports(module).length) throw new Error('Unexpected WASM imports');
-  const workerCount = Math.max(1, Math.min(8, options.workers || (navigator.hardwareConcurrency || 2) - 1));
+  // One logical core stays free for the page. Each render worker keeps its own
+  // deep reference (about 25 MiB at the deepest fixture), so 16 bounds memory.
+  const workerCount = Math.max(1, Math.min(16, options.workers || (navigator.hardwareConcurrency || 2) - 1));
   const canvasReadFrequently = options.willReadFrequently===undefined ? options.progressive!==false : !!options.willReadFrequently;
   const previews = options.preview === false ? null : createPreviewRenderer({module,engineOptions:options.engineOptions,
     gpu:options.gpuPreview!==false,snapshot:(...args)=>view.snapshot(...args),show:showPreview});
