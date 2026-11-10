@@ -150,7 +150,8 @@ if(!isMainThread){
       const minPixels=policy.minimumTilePixels(view,options,compact);
       const queue=createTileQueue(3840,2160,view,{adaptive:true,compact,minPixels});
       const image=new Uint8Array(3840*2160*4),tiles=[],stats={},memories=Array(workersCount).fill(0);
-      let referenceDetails=null,precisionBits=view.deep?Math.max(view.bits,Math.ceil((-2*view.exponent+192)/32)*32):0;
+      // Like the app: no initial hint; each worker starts at its own minimum.
+      let referenceDetails=null,precisionBits=0;
       start=performance.now();
       const progress=()=>{
         const row={event:'progress',status:'running',id:fixture.id,seconds:(performance.now()-start)/1000,

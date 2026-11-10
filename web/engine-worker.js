@@ -7,7 +7,8 @@ const statExports = {
   ddIterations: 'deep_stat_dd_iterations', referenceIterations: 'deep_stat_reference_iterations',
   localReferences: 'deep_stat_local_references', perturbIterations: 'deep_stat_perturb_iterations',
   // Certificates cover the selected iteration limit, not set membership.
-  certifiedPixels: 'deep_stat_certified_pixels', certificateIterations: 'deep_stat_certificate_iterations'
+  certifiedPixels: 'deep_stat_certified_pixels', certificateIterations: 'deep_stat_certificate_iterations',
+  ddPerturbPixels: 'deep_stat_dd_perturb_pixels', ddPerturbIterations: 'deep_stat_dd_perturb_iterations'
 };
 
 function requestedPrecision(value) {
@@ -37,7 +38,9 @@ function configure(data) {
   else if (view.deep) {
     if (view.perturb && referenceGeneration !== data.generation) throw new Error('Missing deep zoom reference');
     if (!view.perturb) {
-      precisionBits = Math.max(view.bits, Math.ceil((-2 * view.exponent + 192) / 32) * 32,
+      // Start near the needed -e plus tolerance and reserve; certified error
+      // bounds request more bits when a pixel needs them (see deep-zoom.c).
+      precisionBits = Math.max(view.bits, Math.ceil((-view.exponent + 160) / 32) * 32,
         requestedPrecision(configuration.precisionHint), requestedPrecision(data.precisionHint));
       if (!engine.deep_allocate(precisionBits, view.iterations)) throw new Error('Deep zoom memory exhausted');
       writeCentre(engine, view);

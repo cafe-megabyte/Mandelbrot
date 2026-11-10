@@ -89,5 +89,21 @@ for (const variant of ['scalar', 'simd']) {
   }
   report(`${variant}: mirrored shallow images match full computation byte for byte; deep images agree within the existing one-channel-step tolerance.`);
 }
+{
+  // Navigation-end snapping moves at most a quarter pixel, only onto a raster
+  // that mirrors rows, and never moves a view whose axis is outside the image.
+  const {createView} = new Function(readText('web/view.js').replace(/^export /gm, '') + '\nreturn {createView};')();
+  for (const [zoom, dy, width, height, expectMove] of [[40.2, -123.4, 3840, 2160, true], [9, 0.3, 1001, 777, true],
+      [3.3, 17.37, 1280, 800, false], [30, 2000, 1280, 800, false]]) {
+    const v = createView(); v.set({real: '-0.75', imag: '0', zoom: 0});
+    v.change(2 ** zoom, {x: width / 2, y: height / 2}, {x: width / 2, y: height / 2 + dy}, width, height);
+    const before = v.snapshot(width, height, width, height), moved = v.alignAxis(width, height, width, height);
+    const after = v.snapshot(width, height, width, height), spacing = before.mantissa * 2 ** before.exponent;
+    const shift = Math.abs(Number(BigInt(after.imag) - BigInt(before.imag)) / 2 ** before.bits / spacing);
+    assert(moved === expectMove && shift <= 0.25 && (!moved || renderBands(height, after).mirroredRows > 0),
+      `Axis alignment failed at zoom ${zoom}`);
+    assert(moved || after.imag === before.imag, 'Axis alignment changed a view without mirrored rows');
+  }
+}
 report('Symmetry covers every row once: even/odd heights, shifted overlap, off-axis/nonaligned views, surface boundaries and deep coordinates.');
 var testDone = true;

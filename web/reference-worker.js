@@ -31,7 +31,8 @@ async function prepare(data, id) {
   if (initializationError) throw new Error(initializationError);
   if (!engine) throw new Error('Reference worker is not initialized');
   const started = performance.now(), view = data.view;
-  const minimumBits = Math.max(view.bits, Math.ceil((-2 * view.exponent + 192) / 32) * 32);
+  // The reference error is certified at every step; insufficient bits retry.
+  const minimumBits = Math.max(view.bits, Math.ceil((-view.exponent + 160) / 32) * 32);
   const key = JSON.stringify([view.real, view.imag, view.bits, view.iterations]);
   const requestedRadius = radius(view, data.width, data.height);
   // Orbit and BLA data stay in WASM. A smaller footprint can safely use the

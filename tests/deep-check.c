@@ -107,6 +107,46 @@ static void check_local_reference_reuse(void){
         "Fresh high-precision reference did not become reusable");
     deep_set_options(saved);
 }
+/* Independent row-wise schoolbook product (the former production algorithm).
+ * Short products leave limbs below fraction unspecified, so the checks below
+ * compare the kept limbs, the truncation and the rounding flag against this. */
+static void reference_product(uint32_t *out,const uint32_t *a,const uint32_t *b,unsigned n){
+    for(unsigned j=0;j<2*n;++j)out[j]=0;
+    for(unsigned j=0;j<n;++j){
+        uint64_t carry=0;
+        for(unsigned k=0;k<n;++k){uint64_t value=(uint64_t)a[j]*b[k]+out[j+k]+carry;out[j+k]=(uint32_t)value;carry=value>>32;}
+        out[j+n]=(uint32_t)carry;
+    }
+}
+static int reference_rounded(const uint32_t *full){for(unsigned j=0;j<fraction;++j)if(full[j])return 1;return 0;}
+static void require_kept(const uint32_t *full,const uint32_t *truncated,int rounded,int whole,const char *message){
+    require(!memcmp(full+fraction,product+fraction,digits*sizeof(uint32_t)),message);
+    require(!whole || !memcmp(full,product,2*digits*sizeof(uint32_t)),message);
+    require(!memcmp(full+fraction,truncated,digits*sizeof(uint32_t)),message);
+    require(rounded==reference_rounded(full),message);
+}
+static void check_short_products(void){
+    uint32_t random=0x2545f491u;
+    for(unsigned n=3;n<=40;++n){
+        require(deep_allocate((n-1)*32,32),"Short product allocation failed");
+        uint32_t *full=malloc(2*digits*sizeof(uint32_t));require(full!=NULL,"Short product fixture allocation failed");
+        for(unsigned sample=0;sample<200;++sample){
+            for(unsigned j=0;j<digits;++j){
+                random=random*1664525u+1013904223u;
+                cr_big[j]=sample%5==0?UINT32_MAX:sample%5==1?(j+1<digits?UINT32_MAX:random>>8):random;
+                random=random*1664525u+1013904223u;
+                ci_big[j]=sample%5==0?UINT32_MAX:sample%5==2?(j?0:random):random;
+            }
+            reference_product(full,cr_big,ci_big,digits);
+            rounded_product=0;multiply_big(scratch[6],cr_big,ci_big);
+            require_kept(full,scratch[6],rounded_product,0,"Short product differs from the full product");
+            reference_product(full,cr_big,cr_big,digits);
+            rounded_product=0;square_big(scratch[6],cr_big);
+            require_kept(full,scratch[6],rounded_product,0,"Short square differs from the full square");
+        }
+        free(full);
+    }
+}
 static void check_squares(void){
     const unsigned precisions[]={64,96,256,1024,3424};uint32_t random=0x691683b7u;
     for(unsigned p=0;p<sizeof(precisions)/sizeof(precisions[0]);++p){
@@ -115,12 +155,12 @@ static void check_squares(void){
         for(unsigned sample=0;sample<400;++sample){
             for(unsigned j=0;j<digits;++j){random=random*1664525u+1013904223u;
                 cr_big[j]=sample==0?UINT32_MAX:sample==1?(j%2?0:UINT32_MAX):sample==2?0:random;}
-            rounded_product=0;multiply_big(scratch[6],cr_big,cr_big);int rounded=rounded_product;
-            memcpy(expected,product,2*digits*sizeof(uint32_t));
+            reference_product(expected,cr_big,cr_big,digits);
+            rounded_product=0;multiply_big(scratch[6],cr_big,cr_big);
+            require_kept(expected,scratch[6],rounded_product,0,"Product of equal operands lost a carry");
             rounded_product=0;square_big(scratch[7],cr_big);
-            require(!memcmp(expected,product,2*digits*sizeof(uint32_t)),"Specialized square lost a carry");
+            require_kept(expected,scratch[7],rounded_product,0,"Specialized square lost a carry");
             require(!memcmp(scratch[6],scratch[7],digits*sizeof(uint32_t)),"Specialized square changed truncation");
-            require(rounded==rounded_product,"Specialized square changed rounding flag");
         }
         free(expected);
     }
@@ -136,12 +176,12 @@ static void check_karatsuba(void){
                 random=random*1664525u+1013904223u;cr_big[j]=sample==0?UINT32_MAX:sample==1?0:random;
                 random=random*1664525u+1013904223u;ci_big[j]=sample==0?UINT32_MAX:sample==2?0:random;
             }
+            reference_product(expected,cr_big,ci_big,digits);
             deep_set_options(saved&~DEEP_KARATSUBA);rounded_product=0;multiply_big(scratch[6],cr_big,ci_big);
-            int rounded=rounded_product;memcpy(expected,product,2*digits*sizeof(uint32_t));
+            require_kept(expected,scratch[6],rounded_product,0,"Schoolbook product mismatch");
             deep_set_options(saved|DEEP_KARATSUBA);rounded_product=0;multiply_big(scratch[7],cr_big,ci_big);
-            require(!memcmp(expected,product,2*digits*sizeof(uint32_t)),"Karatsuba product mismatch");
+            require_kept(expected,scratch[7],rounded_product,digits>=KARATSUBA_MULTIPLY_MIN,"Karatsuba product mismatch");
             require(!memcmp(scratch[6],scratch[7],digits*sizeof(uint32_t)),"Karatsuba truncation mismatch");
-            require(rounded==rounded_product,"Karatsuba rounding flag mismatch");
         }
         free(expected);
     }
@@ -174,16 +214,17 @@ static void check_karatsuba_general(void){
                 ci_big[j]=sample==0?UINT32_MAX:sample==2?(j<digits/2?UINT32_MAX:0):sample==3?0:random;
             }
             for(unsigned square=0;square<2;++square){
+                reference_product(expected,cr_big,square?cr_big:ci_big,digits);
                 deep_set_options(saved&~DEEP_KARATSUBA);rounded_product=0;
                 if(square)square_big(truncated,cr_big);else multiply_big(truncated,cr_big,ci_big);
-                int rounded=rounded_product;memcpy(expected,product,2*digits*sizeof(uint32_t));
+                require_kept(expected,truncated,rounded_product,0,square?"Schoolbook square mismatch":"Schoolbook product mismatch");
                 for(unsigned j=0;j<2*digits;++j)scratch[6][j]=0xa5a5a5a5u^j;
                 deep_set_options(saved|DEEP_KARATSUBA);rounded_product=0;
                 if(square)square_big(scratch[0],cr_big);else multiply_big(scratch[0],cr_big,ci_big);
                 for(unsigned j=0;j<2*digits;++j)require(scratch[6][j]==(0xa5a5a5a5u^j),"Karatsuba workspace overflow");
-                require(!memcmp(expected,product,2*digits*sizeof(uint32_t)),square?"Karatsuba square mismatch":"Odd Karatsuba product mismatch");
+                require_kept(expected,scratch[0],rounded_product,digits>=(square?KARATSUBA_SQUARE_MIN:KARATSUBA_MULTIPLY_MIN),
+                    square?"Karatsuba square mismatch":"Odd Karatsuba product mismatch");
                 require(!memcmp(truncated,scratch[0],digits*sizeof(uint32_t)),"Generalized Karatsuba truncation mismatch");
-                require(rounded==rounded_product,"Generalized Karatsuba rounding flag mismatch");
             }
         }
         free(expected);free(truncated);
@@ -344,6 +385,9 @@ static void check_analytic_deep_boundaries(void){
            rounds onto +1/4 or -5/4. Neither point may bypass the orbit. */
         unsigned bit=fraction*32-400;
         cr_big[bit/32]|=UINT32_C(1)<<(bit%32);
+        /* -5/4-tiny is real and therefore in the set (decided exactly on the
+           axis); a tiny imaginary part keeps it a pure bulb-boundary test. */
+        if(fixture)ci_big[bit/32]|=UINT32_C(1)<<(bit%32);
         int sign=fixture?-1:1;
         deep_begin(sign,1,1,-400,1,1);
         while(!deep_reference(32)){}deep_finish();
@@ -425,8 +469,8 @@ static void prepare_cusp_precise_series(void){
 static void check_precise_series(void){
     unsigned saved=deep_options;
     const unsigned variants[]={0,DEEP_TIGHT_SERIES,DEEP_PRECISE_SERIES,DEEP_PRECISE_SERIES|DEEP_TIGHT_SERIES};
-    const unsigned cases[][4]={{0,0,32,8},{1920,1080,32,8},{1916,1078,8,4}};
-    uint32_t expected[256];
+    const unsigned cases[][4]={{0,0,32,16},{1920,1080,32,16},{1916,1078,8,4}};
+    uint32_t expected[512];
     for(unsigned fixture=0;fixture<3;++fixture){
         unsigned before_prefix=0,dd_prefix=0,before_count=0;uint64_t before_iterations=0,before_reference=0;
         unsigned tx=cases[fixture][0],ty=cases[fixture][1],w=cases[fixture][2],h=cases[fixture][3];
@@ -441,7 +485,7 @@ static void check_precise_series(void){
                 require(!memcmp(expected,output,w*h*4),"More accurate prefix changed a pixel");
                 require(series_start>before_prefix && deep_perturb_iterations<before_iterations,
                     "Accurate prefix did not replace ordinary iterations");
-                require((prefix_dd_used!=0)==((variants[variant]&DEEP_PRECISE_SERIES)!=0 && w*h>=128),
+                require((prefix_dd_used!=0)==((variants[variant]&DEEP_PRECISE_SERIES)!=0 && w*h>=PRECISE_SERIES_MIN_PIXELS),
                     "Accurate prefix chose the wrong arithmetic");
                 /* The replay stops after its DD prefix: it adds some, but at most
                    one more pass of, reference work and leaves the orbit intact. */
@@ -472,19 +516,19 @@ static void check_precise_series(void){
     /* A successful finite-budget proof must bypass the precise replay even
        when requested. This is a non-analytic high-period cusp32 tile. */
     deep_set_options(779|DEEP_PRECISE_SERIES);prepare_cusp_certificate(9216);
-    require(deep_render_tile(1920,1080,32,8)==sizeof(expected) && deep_certified_pixels==256,
+    require(deep_render_tile(1920,1080,32,8)==32*8*4 && deep_certified_pixels==256,
         "Precise replay certificate fixture failed");
     require(!prefix_dd_used && !prefix_dd_active && !series_start && deep_reference_iterations==9216,
         "Certified tile unnecessarily replayed its reference");
     /* A completed prefix survives reference reuse and limb-precision growth. */
     deep_set_options(779|DEEP_PRECISE_SERIES|DEEP_REUSE_REFERENCE);prepare_cusp_precise_series();
-    require(deep_render_tile(0,0,32,8)==sizeof(expected),"Precise prefix reuse fixture failed");
+    require(deep_render_tile(0,0,32,16)==sizeof(expected),"Precise prefix reuse fixture failed");
     memcpy(expected,output,sizeof(expected));unsigned prefix=series_start;
     Extended coefficients[8];memcpy(coefficients,series_coefficients,sizeof(coefficients));
     require(deep_grow_precision(352),"Precise prefix precision growth failed");
     require(!prefix_dd_active && series_start==prefix && !memcmp(coefficients,series_coefficients,sizeof(coefficients)),
         "Precision growth damaged a completed prefix");
-    require(deep_render_tile(0,0,32,8)==sizeof(expected) && !deep_reference_iterations && series_start==prefix &&
+    require(deep_render_tile(0,0,32,16)==sizeof(expected) && !deep_reference_iterations && series_start==prefix &&
         !memcmp(expected,output,sizeof(expected)),"Cached precise prefix changed after growth");
     /* A short reference selects tight coefficients without a second pass. */
     deep_set_options((779&~DEEP_BLACK_CERTIFICATE)|DEEP_PRECISE_SERIES);
@@ -546,10 +590,115 @@ static void check_variants(void){
     }
     deep_set_options(saved_options);
 }
+/* The double perturbation path must agree with the Extended path on local
+ * references: identical membership, at most one level per channel, and the
+ * same comparison with the direct fixed-point orbit for sample pixels. */
+static void check_double_perturbation(void){
+    unsigned saved=deep_options;
+    static uint32_t extended_tile[256*64];
+    for(unsigned fixture=0;fixture<3;++fixture){
+        unsigned tx=fixture==2?1792:1920-128,ty=fixture==2?1040:1080-32,w=256,h=64;
+        for(unsigned variant=0;variant<2;++variant){
+            deep_set_options(variant?deep_default_options():deep_default_options()&~DEEP_DOUBLE_PERTURB);
+            if(fixture==0)prepare_cusp_certificate(9216);
+            else if(fixture==1)prepare_cusp_precise_series();
+            else {
+                require(deep_allocate(288,7680),"Double path allocation failed");
+                input_decimal(cr_big,"0.743643887037151");input_decimal(ci_big,"0.13182590420533");
+                require(deep_configure(3840,2160,1,-37,7680,-1,1),"Double path configuration failed");
+            }
+            unsigned bytes=deep_render_tile(tx,ty,w,h),retries=0;
+            while(!bytes && deep_needs_precision() && retries++<32){
+                require(deep_grow_precision(fraction*32+64),"Double path precision growth failed");
+                bytes=deep_render_tile_resume(tx,ty,w,h);
+            }
+            require(bytes==w*h*4,"Double path render did not settle");
+            if(!variant){memcpy(extended_tile,output,bytes);continue;}
+            require(deep_perturb_iterations>0,"Double path fixture did not perturb");
+            for(unsigned pixel=0;pixel<w*h;++pixel){
+                require((extended_tile[pixel]==UINT32_C(0xff000000))==(output[pixel]==UINT32_C(0xff000000)),
+                    "Double perturbation changed membership");
+                for(unsigned channel=0;channel<3;++channel){
+                    int a=(extended_tile[pixel]>>(channel*8))&255,b=(output[pixel]>>(channel*8))&255;
+                    require(abs(a-b)<=1,"Double perturbation colour differs");
+                }
+            }
+            /* Direct orbits for a sparse subset, against the same frame grid. */
+            for(unsigned pixel=0;pixel<w*h;pixel+=331){
+                unsigned x=pixel%w,y=pixel/w;
+                Extended dc=ext(((double)(tx+x)+0.5-reference_origin_x)*spacing_extended.r,
+                    (reference_origin_y-(double)(ty+y)-0.5)*spacing_extended.r,spacing_extended.e);
+                uint32_t direct=fixed_pixel(dc);
+                if(deep_needs_precision())continue;
+                require((direct==UINT32_C(0xff000000))==(output[pixel]==UINT32_C(0xff000000)),
+                    "Double perturbation membership differs from the fixed orbit");
+                for(unsigned channel=0;channel<3;++channel){
+                    int a=(direct>>(channel*8))&255,b=(output[pixel]>>(channel*8))&255;
+                    require(abs(a-b)<=1,"Double perturbation differs from the fixed orbit");
+                }
+            }
+        }
+    }
+    deep_set_options(saved);
+}
+/* DD perturbation must agree with the direct fixed-point orbit wherever it
+ * decides a pixel, at a local depth, a global depth and beyond the double range. */
+static void check_dd_perturbation(void){
+    const struct {const char *r,*i;int rs,is,e;unsigned limit;} fixtures[]={
+        {"0.743643887037151",".13182590420533",-1,1,-37,4096},
+        {"0.0","1.0",1,1,-400,2048},
+        {"0.0","1.0",1,1,-1600,4096}};
+    unsigned decided=0;
+    for(unsigned f=0;f<3;++f){
+        prepare(fixtures[f].r,fixtures[f].rs,fixtures[f].i,fixtures[f].is,fixtures[f].e,fixtures[f].limit);
+        require(dd_perturbation_ready(),"DD reference copy missing");
+        for(unsigned y=0;y<17;++y)for(unsigned x=0;x<33;++x){
+            Extended dc=ext((double)x-16,8-(double)y,fixtures[f].e);
+            uint32_t a=0;int state=dd_perturb_pixel(dc,&a);
+            if(state!=1)continue;
+            uint32_t b=fixed_pixel(dc);
+            if(deep_needs_precision())continue;
+            require((a==UINT32_C(0xff000000))==(b==UINT32_C(0xff000000)),"DD perturbation membership mismatch");
+            for(unsigned ch=0;ch<3;++ch)require(abs((int)((a>>(ch*8))&255)-(int)((b>>(ch*8))&255))<=1,"DD perturbation colour mismatch");
+            ++decided;
+        }
+    }
+    require(decided>900,"DD perturbation decided too few pixels");
+}
+/* Exactly real views near c=-2: a real reference stops by its derivative rule
+ * instead of demanding about one bit per iteration, and pixel rows that are
+ * exactly real are decided without any reference. Results agree with the
+ * direct fixed-point orbit. */
+static void check_real_axis(void){
+    unsigned saved=deep_options;deep_set_options(deep_default_options());
+    prepare("1.8",-1,"0.0",1,-100,26112);
+    require(!deep_needs_precision() && deep_header->count<26112 && deep_header->count>64,
+        "Real reference did not stop by its derivative rule");
+    for(int j=-6;j<=6;++j)for(int k=1;k<=3;++k){
+        Extended dc=ext(j*37.0+0.5,k*0.5,-100);
+        uint32_t a=perturb_pixel(dc),b=fixed_pixel(dc);
+        if(deep_needs_precision())continue;
+        require((a==UINT32_C(0xff000000))==(b==UINT32_C(0xff000000)),"Truncated real reference changed membership");
+        for(unsigned ch=0;ch<3;++ch)require(abs((int)((a>>(ch*8))&255)-(int)((b>>(ch*8))&255))<=1,"Truncated real reference changed colour");
+    }
+    /* Local zoom, odd height: the middle row is exactly real and black. */
+    require(deep_allocate(224,13056),"Axis allocation failed");
+    input_decimal(cr_big,"1.99999994484928247856047162588000304676481875363273968230370556883879196163888991577550768852233886718");
+    clear_big(ci_big);
+    require(deep_configure(1920,1081,1.3,-59,13056,-1,1),"Axis configuration failed");
+    require(deep_render_tile(0,540,256,1)==256*4 && !deep_local_references && !deep_reference_iterations,
+        "Exact axis row built a reference");
+    for(unsigned x=0;x<256;++x)require(output[x]==UINT32_C(0xff000000),"Exact axis pixel was not black");
+    require(deep_render_tile(0,539,256,1)==256*4 && deep_local_references==1,"Row beside the axis skipped its reference");
+    deep_set_options(saved);
+}
 int main(void){
+    check_real_axis();
+    check_dd_perturbation();
+    check_double_perturbation();
     require(!deep_allocate(0,512),"Invalid precision accepted");
     require(!deep_allocate(0x7fffffbfu,0x7fffffbfu),"Workspace size overflow was accepted");
-    check_bla_pruning();check_local_reference_reuse();check_squares();check_karatsuba();check_karatsuba_general();check_growth_and_resume();check_rescaled_addition();check_exact_exponent_shifts();check_reference_coordinates();
+    check_bla_pruning();check_local_reference_reuse();check_short_products();check_squares();check_karatsuba();check_karatsuba_general();check_growth_and_resume();check_rescaled_addition();check_exact_exponent_shifts();check_reference_coordinates();
     check_big_conversion();check_adaptive_boundaries();check_analytic_deep_boundaries();check_black_certificates();check_precise_series();check_variants();
     prepare("0.743643887037151",-1,"0.13182590420533",1,-32,4096);
     unsigned comparisons=0;

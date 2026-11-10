@@ -76,8 +76,17 @@ export async function start(root, options = {}) {
   const navigation = createNavigation(root, view, active => {
     navigationActive = active;
     if (active) { scheduler.hold(true); resize(); }
-    else { saveURL(); selectView(); }
+    else { alignAxis(); saveURL(); selectView(); }
   });
+  // Snap to the real axis' half-pixel grid for the raster the final frame uses.
+  function alignAxis() {
+    if (options.alignAxis === false) return;
+    const rect = root.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+    const exact = physicalSize && physicalSize.dpr === dpr && physicalSize.cssWidth === rect.width &&
+      physicalSize.cssHeight === rect.height ? physicalSize : null;
+    const width = exact ? exact.width : Math.round(rect.width*dpr), height = exact ? exact.height : Math.round(rect.height*dpr);
+    if (rect.width && rect.height && width && height) view.alignAxis(rect.width, rect.height, width, height);
+  }
   function selectView() {
     navigationActive = false;
     previewWindow = true;

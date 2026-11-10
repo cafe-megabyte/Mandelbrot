@@ -100,7 +100,32 @@ export function createView(saved) {
     zoom=z;precision(minimum);real=decimalFixed(r,bits);imag=decimalFixed(i,bits);++revision;
   }
   function reset(){set({});}
-  return {snapshot,change,set,reset};
+  // At the end of a navigation, move the centre by at most a quarter pixel
+  // onto the half-pixel grid of the real axis when the axis is visible and the
+  // move lets renderBands reuse conjugate rows. Every pixel is still exact.
+  function alignAxis(width,height,physicalWidth,physicalHeight) {
+    const v=snapshot(width,height,physicalWidth,physicalHeight);
+    const rows=physicalHeight ?? height*(physicalWidth ?? width)/width;
+    const spacing=v.mantissa*2**v.exponent;
+    if (!zoom || !(Math.abs(v.centreImag)<rows/2*spacing)) return false;
+    const bytes=new DataView(new ArrayBuffer(8));bytes.setFloat64(0,v.mantissa);
+    const high=bytes.getUint32(0),low=bytes.getUint32(4),e=(high>>>20)&2047;
+    if (!e) return false;
+    const significand=(BigInt(high&0xfffff)<<32n)|BigInt(low)|(1n<<52n);
+    // Half spacing = significand*2^power in units of the fixed-point grid.
+    const power=bits+(e-1075)+v.exponent-1;
+    if (power<0) return false;
+    const step=significand<<BigInt(power);
+    const sign=imag<0n?-1n:1n,magnitude=imag<0n?-imag:imag;
+    const next=sign*((magnitude+step/2n)/step)*step;
+    if (next===imag) return false;
+    // Shallow rows mirror only for exactly opposite doubles; keep the view
+    // unchanged unless the snapped raster actually reuses rows.
+    const previous=imag;imag=next;
+    if (!renderBands(Math.round(rows),snapshot(width,height,physicalWidth,physicalHeight)).mirroredRows) { imag=previous; return false; }
+    ++revision;return true;
+  }
+  return {snapshot,change,set,reset,alignAxis};
 }
 export function previewTransform(before,after,width,height) {
   if (!before || !after) return '';
@@ -116,7 +141,8 @@ export function previewTransform(before,after,width,height) {
   return `translate(${x}px,${y}px) scale(${factor})`;
 }
 // Conjugate pixels can share a result only when reflection maps pixel centres
-// to pixel centres. Test the binary ratio exactly; never snap a panned view.
+// to pixel centres. Test the binary ratio exactly; alignAxis may have moved a
+// navigated view onto that grid, but this test never assumes it.
 export function renderBands(height, view, tileHeight = 64) {
   const bytes = new DataView(new ArrayBuffer(8));
   function binary(value) {
