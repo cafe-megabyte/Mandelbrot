@@ -9,7 +9,11 @@ after its first successful installation. No external services or dependencies.
 ## Use
 
 - Wheel or pinch to zoom; drag to pan.
-- Click for fullscreen; Escape to leave.
+- Tap or click the image for the menu: save the PNG, copy the URL, enter full
+  screen or enter coordinates. Coordinates accept comma or point as decimal
+  separator; zoom is the power of two (`zoom=10` is 1024×). Pasting a link or
+  the PNG's metadata JSON fills in all three fields.
+- `Enter` opens the menu, `F` toggles full screen, Escape closes either.
 - `R` or `Home` resets the view.
 - Right-click the completed image to copy or save a full-resolution PNG.
 - Copy the URL to share or restore the selected centre and zoom.

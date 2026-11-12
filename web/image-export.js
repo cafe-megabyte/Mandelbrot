@@ -57,7 +57,7 @@ export function createImageExport(root, isCurrent, options = {}) {
             const file = new File([data.blob], name, {type: 'image/png'});
             const url = URL.createObjectURL(file); job.url = url;
             const image = new Image(); image.className = 'export-image'; image.alt = '';
-            image.draggable = false;
+            image.draggable = false; image._file = file;
             image.setAttribute('aria-hidden', 'true');
             Object.assign(image.style, {position: 'absolute', inset: '0', width: '100%', height: '100%', display: 'block'});
             const decodeStarted = performance.now();

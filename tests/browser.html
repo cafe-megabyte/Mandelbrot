@@ -55,7 +55,7 @@ frame.addEventListener('load',()=>{
       assert(doc.fullscreenElement===active,'Fullscreen changed during pixel verification');
       assert(lastFrame!==previousFrame&&lastFrame?.phase==='final','Fullscreen transition did not calculate a fresh final frame');
       if(active){
-        log('PASS: real image click entered Fullscreen API on the stable viewport; every fullscreen PNG pixel is correct.');
+        log('PASS: menu full screen entry entered Fullscreen API on the stable viewport; every fullscreen PNG pixel is correct.');
         // Test-only automatic exit: no controls or keyboard interception in the app.
         fullscreenTimer=setTimeout(()=>doc.exitFullscreen().catch(error=>log(`FAIL: ${error.message}`)),10000);
       }else{
@@ -510,7 +510,7 @@ document.getElementById('fullscreen-test').onclick=async()=>{
     const root=await ready();await exported(root);
     assert(frame.contentDocument.fullscreenEnabled&&root.requestFullscreen,'Fullscreen API is not allowed in this browser/frame');
     fullscreenTest=true;
-    log('Fullscreen check armed: click the app image. The test verifies every PNG pixel, then exits automatically after 10 seconds.');
+    log('Fullscreen check armed: click the app image, then choose Full screen in its menu. The test verifies every PNG pixel, then exits automatically after 10 seconds.');
   }catch(error){log(`FAIL: ${error.message}`);}
 };
 ready().then(()=>log('App ready. Run checks or stop the server and use reload/resize.')).catch(error=>log(`FAIL: ${error.message}`));

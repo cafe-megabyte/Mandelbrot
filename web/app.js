@@ -1,7 +1,8 @@
 import {createResizeScheduler} from './resize-scheduler.js';
 import {createImageExport} from './image-export.js';
-import {createView, previewTransform, viewFragment, viewFromFragment} from './view.js';
+import {createView, fixedDecimal, previewTransform, viewFragment, viewFromFragment} from './view.js';
 import {createNavigation} from './navigation.js';
+import {createMenu} from './menu.js';
 import {createTileQueue} from './tile-queue.js';
 import {createPresentation} from './presentation.js';
 import {createPreviewRenderer} from './preview.js';
@@ -33,7 +34,7 @@ function minimumTilePixels(view, options, compactTiles = useCompactTiles(view, o
 export async function start(root, options = {}) {
   let disposed = false, pending, frameRequest = 0, selectionRequest = 0, navigationActive = false, previewWindow = false;
   let physicalSize, replacementCount = 0, fullscreenPending = false, referenceWorker, referenceIterations = 0;
-  let referencePreparing = false, viewURL = location.hash;
+  let referencePreparing = false, viewURL = location.hash, linkFields = null;
   let progress, progressFill, progressPill, progressCompleted, progressPercent, progressTotal;
   const progressLanguage = (navigator.languages?.[0] || navigator.language || 'en')
     .toLowerCase().split('-')[0] === 'de' ? 'de' : 'en';
@@ -45,7 +46,7 @@ export async function start(root, options = {}) {
   const progressNumber = value => progressFormatter.format(value);
   const view = createView(root._mandelbrotView);
   const linkedView = viewFromFragment(location.hash);
-  if (!root._mandelbrotView && linkedView) view.set(linkedView);
+  if (!root._mandelbrotView && linkedView) { view.set(linkedView); rememberLink(linkedView); }
   const slots = [];
   const simdBytes = await loadBytes('engine-simd.wasm');
   const backend = WebAssembly.validate(simdBytes) ? 'simd128' : 'scalar';
@@ -78,6 +79,26 @@ export async function start(root, options = {}) {
     if (active) { scheduler.hold(true); resize(); }
     else { alignAxis(); saveURL(); selectView(); }
   });
+  const menu = createMenu({language: progressLanguage, document, window, navigator, location,
+    fromFragment: viewFromFragment, setView: showView, exportStatus, toggleFullscreen,
+    fullscreenAvailable, fullscreenActive: () => !!document.fullscreenElement,
+    currentFields: () => {
+      const current = currentView();
+      if (linkFields?.revision === current.revision) return linkFields;
+      return {x: fixedDecimal(current.real, current.bits), y: fixedDecimal(current.imag, current.bits), zoom: String(current.zoom)};
+    }});
+  // Until the view moves, the menu offers the link's own short digits instead
+  // of the longer exact binary expansion of the same coordinates.
+  function rememberLink(target) {
+    linkFields = target && {revision: currentView().revision, x: target.real, y: target.imag, zoom: String(target.zoom)};
+  }
+  function showView(target, fragment) { view.set(target); rememberLink(fragment && target); saveURL(fragment); selectView(); }
+  function exportStatus() {
+    const frame = pending, state = root.dataset.exportState, image = frame?.layer.querySelector('img.export-image');
+    return {disabled: state === 'disabled', file: state === 'ready' && image?._file || null,
+      width: frame?.width, height: frame?.height,
+      fraction: !frame ? 0 : frame.completed === frame.total ? 1 : frame.completedPixels / (frame.width * frame.height)};
+  }
   // Snap to the real axis' half-pixel grid for the raster the final frame uses.
   function alignAxis() {
     if (options.alignAxis === false) return;
@@ -100,8 +121,8 @@ export async function start(root, options = {}) {
     cancelAnimationFrame(selectionRequest);
     selectionRequest=requestAnimationFrame(()=>{selectionRequest=0;previewWindow=false;scheduler.hold(false);});
   }
-  function saveURL() {
-    const fragment = viewFragment(currentView());
+  function saveURL(typed) {
+    const fragment = typed && viewFromFragment(typed) ? typed : viewFragment(currentView());
     if (fragment !== location.hash)
       history.replaceState(history.state, '', location.pathname + location.search + fragment);
     viewURL = fragment;
@@ -109,8 +130,8 @@ export async function start(root, options = {}) {
   function restoreURL() {
     if (viewURL === location.hash) return;
     viewURL = location.hash;
-    view.set(viewFromFragment(location.hash) || {});
-    selectView();
+    const target = viewFromFragment(location.hash);
+    view.set(target || {}); rememberLink(target); selectView();
   }
 
   function newSlot() {
@@ -644,14 +665,29 @@ export async function start(root, options = {}) {
     densityQuery.addEventListener('change', densityChanged); resize();
   }
   function resume() { if (!document.hidden) { physicalSize = null; resize(); } }
-  function enterFullscreen(event) {
+  // A single tap or click opens the menu. Drags, pinches, wheel zoom and long
+  // presses are excluded by the navigation's click suppression.
+  function tapped(event) {
     const pictureTarget = event.target.closest('canvas, img.export-image') ||
       (event.target === root && root.querySelector('canvas, img.export-image'));
-    if (disposed || navigation.suppressClick() || event.button !== 0 || !pictureTarget ||
-        document.fullscreenElement || fullscreenPending || !document.fullscreenEnabled || !root.requestFullscreen) return;
+    if (disposed || navigation.suppressClick() || event.button !== 0 || !pictureTarget || menu.isOpen()) return;
+    menu.open();
+  }
+  function key(event) {
+    if (disposed || event.ctrlKey || event.metaKey || event.altKey || event.isComposing || menu.isOpen() ||
+        event.target?.closest?.('input, textarea, select, button, a, dialog')) return;
+    if (event.key === 'f' || event.key === 'F') { event.preventDefault(); toggleFullscreen(); }
+    else if (event.key === 'Enter') { event.preventDefault(); menu.open(); }
+  }
+  function fullscreenAvailable() { return !!(document.fullscreenEnabled && root.requestFullscreen); }
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen?.().catch(error => console.debug('Mandelbrot fullscreen:', error.message)); return;
+    }
+    if (disposed || fullscreenPending || !fullscreenAvailable()) return;
     fullscreenPending = true;
     // Keep the stable viewport element fullscreen while tiles/PNGs are replaced.
-    // Request directly in the click handler to retain user activation.
+    // Request directly in the menu/key handler to retain user activation.
     try {
       root.requestFullscreen({navigationUI: 'hide'})
         .then(fullscreenChanged)
@@ -668,7 +704,7 @@ export async function start(root, options = {}) {
     disposed = true; observer.disconnect(); cancelAnimationFrame(frameRequest);cancelAnimationFrame(selectionRequest);
     scheduler.dispose();
     imageExport.dispose();
-    navigation.dispose(); destroyReference();
+    navigation.dispose(); menu.dispose(); destroyReference();
     previews?.dispose();pending?.presentation?.dispose(pending.shown);
     hideProgress(pending);
     clearTimeout(pending?.revealTimer);
@@ -676,7 +712,8 @@ export async function start(root, options = {}) {
     densityQuery?.removeEventListener('change', densityChanged);
     window.removeEventListener('resize', resize); document.removeEventListener('visibilitychange', resume);
     window.removeEventListener('hashchange', restoreURL); window.removeEventListener('popstate', restoreURL);
-    root.removeEventListener('click', enterFullscreen); document.removeEventListener('fullscreenchange', fullscreenChanged);
+    root.removeEventListener('click', tapped); document.removeEventListener('fullscreenchange', fullscreenChanged);
+    window.removeEventListener('keydown', key);
     for (const slot of slots) {
       clearTimeout(slot.timer); slot.worker.terminate(); slot.buffers.length = 0; slot.job = null;
     }
@@ -693,9 +730,10 @@ export async function start(root, options = {}) {
   catch { observer.observe(root); }
   window.addEventListener('resize', resize); document.addEventListener('visibilitychange', resume);
   window.addEventListener('hashchange', restoreURL); window.addEventListener('popstate', restoreURL);
-  root.addEventListener('click', enterFullscreen); document.addEventListener('fullscreenchange', fullscreenChanged);
+  root.addEventListener('click', tapped); document.addEventListener('fullscreenchange', fullscreenChanged);
+  window.addEventListener('keydown', key);
   densityChanged();
-  return {dispose, backend, setView: target => { view.set(target); saveURL(); selectView(); }, getView: currentView,
+  return {dispose, backend, setView: target => showView(target), getView: currentView,
     reset: () => { view.reset(); saveURL(); selectView(); }};
 }
 

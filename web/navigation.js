@@ -1,5 +1,5 @@
 export function createNavigation(root,view,changed) {
-  const points=new Map();let gesture, moved=false, suppressUntil=0, wheelTimer, safariTimer, safariScale=0, safariMoving=false, safariTarget;
+  const points=new Map();let gesture, moved=false, pressedAt=0, suppressUntil=0, wheelTimer, safariTimer, safariScale=0, safariMoving=false, safariTarget;
   const point=event=>{const r=root.getBoundingClientRect();return {x:event.clientX-r.left,y:event.clientY-r.top};};
   function geometry(){
     const p=[...points.values()];
@@ -10,7 +10,7 @@ export function createNavigation(root,view,changed) {
     if(event.button!==0)return;
     points.set(event.pointerId,point(event));
     try {root.setPointerCapture(event.pointerId);} catch {}
-    gesture=geometry();if(points.size===1)moved=false;
+    gesture=geometry();if(points.size===1){moved=false;pressedAt=performance.now();}
     else {moved=true;suppressUntil=performance.now()+500;}
   }
   function move(event){
@@ -26,7 +26,9 @@ export function createNavigation(root,view,changed) {
     if(!points.delete(event.pointerId))return;
     if(root.hasPointerCapture(event.pointerId))root.releasePointerCapture(event.pointerId);
     if(points.size)gesture=geometry();
-    else {gesture=null;if(moved){suppressUntil=performance.now()+500;changed(false);}}
+    else {gesture=null;if(moved){suppressUntil=performance.now()+500;changed(false);}
+      // A long press is no tap: its click must not open the menu.
+      else if(performance.now()-pressedAt>500)suppressUntil=performance.now()+300;}
   }
   function wheel(event){
     // Safari can deliver both event families for a trackpad pinch. Cancel its
@@ -41,7 +43,7 @@ export function createNavigation(root,view,changed) {
   }
   function drag(event){event.preventDefault();}
   function key(event){
-    if(event.ctrlKey||event.metaKey||event.altKey)return;
+    if(event.ctrlKey||event.metaKey||event.altKey||event.target?.closest?.('input,textarea,select,dialog'))return;
     if(event.key==='Home'||event.key.toLowerCase()==='r'){event.preventDefault();view.reset();changed(false);}
   }
   function safariStart(event){

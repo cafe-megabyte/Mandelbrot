@@ -121,6 +121,7 @@ async function lifecycleFixture({width = 33, height = 17, zoom = 400, preview = 
       navigate=(target,active)=>{view.set(target);changed(active);};
       return {dispose() {}, suppressClick: () => false};
     },
+    createMenu: () => ({open() {}, close() {}, dispose() {}, isOpen: () => false}),
     createImageExport: (element, isCurrent) => ({cancel() {}, dispose() {}, prepare: frame => {
       assertLifecycle(isCurrent(frame), 'A stale frame was exported'); exportFrames.push(frame);
     }})

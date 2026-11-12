@@ -172,5 +172,29 @@ check('wheel-only pinch still settles and disposal removes all gesture callbacks
   f.advance(1000); f.outside.dispatch('gestureend', {scale: 2});
   assert(f.changes.length === count, 'Disposed Safari navigation triggered another render');
 });
+check('a tap may open the menu, but a drag or long press never does', () => {
+  const f = fixture();
+  f.child.dispatch('pointerdown', {pointerId: 1}); f.child.dispatch('pointerup', {pointerId: 1});
+  assert(!f.navigation.suppressClick(), 'A short tap was suppressed');
+  f.advance(1000);
+  f.child.dispatch('pointerdown', {pointerId: 2}); f.child.dispatch('pointermove', {pointerId: 2, clientX: 360});
+  f.child.dispatch('pointerup', {pointerId: 2, clientX: 360});
+  assert(f.navigation.suppressClick(), 'A drag was treated as a tap');
+  f.advance(1000);
+  f.child.dispatch('pointerdown', {pointerId: 3}); f.advance(600); f.child.dispatch('pointerup', {pointerId: 3});
+  assert(f.navigation.suppressClick(), 'A long press was treated as a tap');
+  f.advance(1000);
+  assert(!f.navigation.suppressClick(), 'Click suppression did not expire');
+  f.dispose();
+});
+check('typing in the coordinate fields never triggers navigation keys', () => {
+  const f = fixture(); f.child.dispatch('wheel', {deltaY: -80}); f.advance(150);
+  const zoom = f.zoom(), field = new f.root.constructor(f.window); field.closest = () => field;
+  field.dispatch('keydown', {key: 'r', ctrlKey: false, metaKey: false, altKey: false});
+  assert(f.zoom() === zoom, 'Typing R in a text field reset the view');
+  f.window.dispatch('keydown', {key: 'r', ctrlKey: false, metaKey: false, altKey: false});
+  assert(f.zoom() === 0, 'R no longer resets the view');
+  f.dispose();
+});
 report(`${checks} navigation checks passed.`);
 var testDone = true;
