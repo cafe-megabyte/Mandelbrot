@@ -87,7 +87,9 @@ const STYLE = `
 dialog.mandelbrot-menu{padding:0;border:1px solid rgba(255,255,255,.18);border-radius:14px;background:#15171d;color:#f4f7ff;
   width:min(420px,calc(100vw - 32px));max-height:calc(var(--mandelbrot-vvh,100dvh) - 32px);overflow:auto;box-sizing:border-box;
   font:400 15px/1.4 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 8px 40px rgba(0,0,0,.6);color-scheme:dark}
-dialog.mandelbrot-menu::backdrop{background:rgba(0,0,0,.35)}
+dialog.mandelbrot-menu::backdrop{background:rgba(0,0,0,.35);touch-action:none}
+/* Each textarea is its own scroll container, so every element needs the rule: one-finger scrolling only. */
+dialog.mandelbrot-menu,dialog.mandelbrot-menu *{touch-action:pan-y;overscroll-behavior:contain}
 .mandelbrot-menu [hidden]{display:none!important}
 .mandelbrot-menu .mm-actions{padding:6px 0}
 .mandelbrot-menu .mm-item{display:flex;align-items:center;gap:14px;width:100%;min-height:48px;padding:10px 18px;border:0;background:none;
@@ -187,6 +189,9 @@ export function createMenu(api) {
     // A click on the backdrop targets the dialog itself; its content never does.
     dialog.addEventListener('click', event => { if (event.target === dialog) close(); });
     dialog.addEventListener('close', closed);
+    // Safari's own pinch gestures on the menu must neither zoom the page nor the fractal.
+    for (const type of ['gesturestart', 'gesturechange', 'gestureend'])
+      dialog.addEventListener(type, event => event.preventDefault(), {passive: false});
     api.window?.visualViewport?.addEventListener('resize', viewport);
   }
   function viewport() {
