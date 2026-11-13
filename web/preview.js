@@ -10,6 +10,8 @@ export function previewGPUFits(view,width,height) {
   return Math.fround(spacing) > 0;
 }
 
+let previewWorkerSerial = 0;
+
 export function createPreviewRenderer({module,engineOptions,snapshot,show,gpu=true,
   now=()=>performance.now(),setTimer=setTimeout,clearTimer=clearTimeout}) {
   let worker, ready=false, supported, busy, latest, timer=0, deadline=0, disposed=false;
@@ -19,7 +21,9 @@ export function createPreviewRenderer({module,engineOptions,snapshot,show,gpu=tr
   function initialize() {
     if (worker || disposed) return;
     let target;
-    try { target=new Worker(new URL('./preview-worker.js',import.meta.url),{type:'module'}); }
+    // Unique URL: WebKit merges concurrent loads of one worker URL and the
+    // merged loads bypass the service worker, failing offline (see app.js).
+    try { target=new Worker(new URL(`./preview-worker.js?worker=${++previewWorkerSerial}`,import.meta.url),{type:'module'}); }
     catch { latest=null;supported=false;return; }
     worker=target; ready=false;
     gpuAttempted=gpu && supported!==false && latest && previewGPUFits(latest.view,latest.width,latest.height);

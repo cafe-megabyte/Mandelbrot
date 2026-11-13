@@ -1,6 +1,9 @@
 import {createPngMetadata} from './png-metadata.js';
 
 const SURFACE_SIZE = 1024;
+// Unique worker URLs: WebKit merges concurrent loads of one URL and the merged
+// loads bypass the service worker, so they fail offline (see app.js).
+let pngWorkerSerial = 0;
 
 export function createImageExport(root, isCurrent, options = {}) {
   let task, disposed = false;
@@ -19,7 +22,7 @@ export function createImageExport(root, isCurrent, options = {}) {
     cancel();
     try {
       const metadata = createPngMetadata(frame);
-      const worker = new Worker(new URL('./png-worker.js', import.meta.url), {type: 'module'});
+      const worker = new Worker(new URL(`./png-worker.js?worker=${++pngWorkerSerial}`, import.meta.url), {type: 'module'});
       const job = {worker, frame, started: performance.now(), readbackMilliseconds: 0, packingMilliseconds: 0,
         readbackCalls: 0, readbackBytes: 0, transferBufferAllocations: 0, transferBufferBytes: 0};
       task = job; root.dataset.exportState = 'preparing';

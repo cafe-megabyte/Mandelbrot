@@ -6,6 +6,9 @@ import {createView} from './view.js';
 import {createTileQueue} from './tile-queue.js';
 
 const SURFACE_SIZE = 1024, TILE_BYTES = 256 * 64 * 4;
+// Unique worker URLs: WebKit merges concurrent loads of one URL and the merged
+// loads bypass the service worker, so they fail offline (see app.js).
+let overviewWorkerSerial = 0;
 const STYLE = `
 dialog.mandelbrot-overview{position:fixed;inset:0;width:100%;height:100%;max-width:none;max-height:none;margin:0;padding:0;border:0;
   background:#000;overflow:hidden;cursor:pointer;touch-action:none;outline:none;color-scheme:dark;
@@ -165,7 +168,7 @@ export function createOverview(api) {
 
   function startWorkers() {
     while (slots.length < Math.max(1, api.workers || 1)) {
-      const worker = new Worker(new URL('./engine-worker.js', import.meta.url), {type: 'module'});
+      const worker = new Worker(new URL(`./engine-worker.js?overview=${++overviewWorkerSerial}`, import.meta.url), {type: 'module'});
       const slot = {worker, ready: false, busy: false, task: null, configured: -1, buffer: new ArrayBuffer(TILE_BYTES)};
       worker.onmessage = ({data}) => received(slot, data);
       worker.onerror = event => failed(new Error(event.message || 'Overview worker failed'));

@@ -9,6 +9,10 @@ import {createPresentation} from './presentation.js';
 import {createPreviewRenderer} from './preview.js';
 
 const TILE_WIDTH = 256, TILE_HEIGHT = 64, SURFACE_SIZE = 1024;
+// WebKit merges concurrent loads of one worker URL, and the merged loads bypass
+// the service worker: offline, every worker but the first fails to start. A
+// unique query keeps each load separate; the service worker ignores the query.
+let engineWorkerSerial = 0, referenceWorkerSerial = 0;
 // Keep the scheduling fallback aligned with the verified core default.
 // Explicit engineOptions allow independent optimization experiments.
 const DEFAULT_ENGINE_OPTIONS = 3851;
@@ -145,7 +149,7 @@ export async function start(root, options = {}) {
 
   function newSlot() {
     return new Promise((resolve, reject) => {
-      const worker = new Worker(new URL('./engine-worker.js', import.meta.url), {type: 'module'});
+      const worker = new Worker(new URL(`./engine-worker.js?worker=${++engineWorkerSerial}`, import.meta.url), {type: 'module'});
       const slot = {worker, busy: false, job: null, ready: false,
         buffers: [new ArrayBuffer(TILE_WIDTH * TILE_HEIGHT * 4), new ArrayBuffer(TILE_WIDTH * TILE_HEIGHT * 4)]};
       slots.push(slot);
@@ -602,7 +606,7 @@ export async function start(root, options = {}) {
         destroyReference();
       }
       if (!referenceWorker) {
-        referenceWorker = new Worker(new URL('./reference-worker.js', import.meta.url), {type:'module'});
+        referenceWorker = new Worker(new URL(`./reference-worker.js?worker=${++referenceWorkerSerial}`, import.meta.url), {type:'module'});
         referenceWorker.postMessage({type:'init',module,engineOptions:options.engineOptions});
       }
       const worker = referenceWorker;
