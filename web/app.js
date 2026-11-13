@@ -3,6 +3,7 @@ import {createImageExport} from './image-export.js';
 import {createView, fixedDecimal, previewTransform, viewFragment, viewFromFragment} from './view.js';
 import {createNavigation} from './navigation.js';
 import {createMenu} from './menu.js';
+import {createOverview} from './overview.js';
 import {createTileQueue} from './tile-queue.js';
 import {createPresentation} from './presentation.js';
 import {createPreviewRenderer} from './preview.js';
@@ -79,8 +80,16 @@ export async function start(root, options = {}) {
     if (active) { scheduler.hold(true); resize(); }
     else { alignAxis(); saveURL(); selectView(); }
   });
+  const overview = createOverview({language: progressLanguage, document, window, module, workers: workerCount,
+    engineOptions: options.engineOptions, label: progressLanguage === 'de' ? 'Ausschnitt in der Gesamtansicht' : 'Location in the full view',
+    centre: () => { const current = currentView(); return {real: current.centreReal, imag: current.centreImag}; },
+    size: () => {
+      const rect = root.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+      return physicalSize && physicalSize.dpr === dpr && physicalSize.cssWidth === rect.width && physicalSize.cssHeight === rect.height
+        ? {cssWidth: rect.width, cssHeight: rect.height, width: physicalSize.width, height: physicalSize.height} : null;
+    }});
   const menu = createMenu({language: progressLanguage, document, window, navigator, location,
-    fromFragment: viewFromFragment, setView: showView, exportStatus, toggleFullscreen,
+    fromFragment: viewFromFragment, setView: showView, exportStatus, toggleFullscreen, showOverview: overview.open,
     fullscreenAvailable, fullscreenActive: () => !!document.fullscreenElement,
     currentFields: () => {
       const current = currentView();
@@ -670,11 +679,11 @@ export async function start(root, options = {}) {
   function tapped(event) {
     const pictureTarget = event.target.closest('canvas, img.export-image') ||
       (event.target === root && root.querySelector('canvas, img.export-image'));
-    if (disposed || navigation.suppressClick() || event.button !== 0 || !pictureTarget || menu.isOpen()) return;
+    if (disposed || navigation.suppressClick() || event.button !== 0 || !pictureTarget || menu.isOpen() || overview.isOpen()) return;
     menu.open();
   }
   function key(event) {
-    if (disposed || event.ctrlKey || event.metaKey || event.altKey || event.isComposing || menu.isOpen() ||
+    if (disposed || event.ctrlKey || event.metaKey || event.altKey || event.isComposing || menu.isOpen() || overview.isOpen() ||
         event.target?.closest?.('input, textarea, select, button, a, dialog')) return;
     if (event.key === 'f' || event.key === 'F') { event.preventDefault(); toggleFullscreen(); }
     else if (event.key === 'Enter') { event.preventDefault(); menu.open(); }
@@ -704,7 +713,7 @@ export async function start(root, options = {}) {
     disposed = true; observer.disconnect(); cancelAnimationFrame(frameRequest);cancelAnimationFrame(selectionRequest);
     scheduler.dispose();
     imageExport.dispose();
-    navigation.dispose(); menu.dispose(); destroyReference();
+    navigation.dispose(); menu.dispose(); overview.dispose(); destroyReference();
     previews?.dispose();pending?.presentation?.dispose(pending.shown);
     hideProgress(pending);
     clearTimeout(pending?.revealTimer);

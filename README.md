@@ -10,7 +10,8 @@ after its first successful installation. No external services or dependencies.
 
 - Wheel or pinch to zoom; drag to pan.
 - Tap or click the image for the menu: save the PNG, copy the URL, enter full
-  screen or enter coordinates. Coordinates accept comma or point as decimal
+  screen, show the current location in the full view (any tap or click returns)
+  or enter coordinates. Coordinates accept comma or point as decimal
   separator; zoom is the power of two (`zoom=10` is 1024×). Pasting a link or
   the PNG's metadata JSON fills in all three fields.
 - `Enter` opens the menu, `F` toggles full screen, Escape closes either.

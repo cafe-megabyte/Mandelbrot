@@ -3,6 +3,10 @@ const {parseDecimal, extractView, viewInput, viewFromFragment} = new Function(
   readText('web/view.js').replace(/^export /gm, '') + '\n' +
   readText('web/menu.js').replace(/^export /gm, '') +
   '\nreturn {parseDecimal, extractView, viewInput, viewFromFragment};')();
+const {overviewPoint} = new Function(
+  readText('web/view.js').replace(/^export /gm, '') + '\n' +
+  readText('web/overview.js').replace(/^import .*\n/gm, '').replace(/^export /gm, '').replace(/import\.meta/g, '({url: "file:///test/"})') +
+  '\nreturn {overviewPoint};')();
 const assert = (ok, message) => { if (!ok) throw new Error(message); };
 let checks = 0;
 const same = (actual, expected, label) => {
@@ -42,5 +46,10 @@ same([deep.real, deep.zoom, deep.bits >= 2000], [deepX, 1600, true], 'deep coord
 same(viewInput({x: 'a', y: '', zoom: '-1'}, viewFromFragment).errors, {x: 'number', y: 'number', zoom: 'zoomRange'}, 'field errors');
 same(viewInput({x: '0', y: '0', zoom: '1e9'}, viewFromFragment).errors, {zoom: 'zoomLarge'}, 'zoom bound');
 same(viewInput({x: '0', y: '0', zoom: '-0'}, viewFromFragment).target.zoom, 0, 'negative zero zoom');
+// Location overview: the start view's centre and corners in CSS pixels, on a 2x display.
+const round = point => ({x: Math.round(point.x * 1e6) / 1e6, y: Math.round(point.y * 1e6) / 1e6});
+same(round(overviewPoint(-0.75, 0, {cssWidth: 600, cssHeight: 400, width: 1200, height: 800})), {x: 300, y: 200}, 'overview centre');
+same(round(overviewPoint(-2.625, 1.25, {cssWidth: 600, cssHeight: 400, width: 1200, height: 800})), {x: 0, y: 0}, 'overview wide corner');
+same(round(overviewPoint(-0.75, -1.875, {cssWidth: 400, cssHeight: 500, width: 800, height: 1000})), {x: 200, y: 500}, 'overview tall edge');
 report(`${checks} menu checks passed.`);
 var testDone = true;

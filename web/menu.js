@@ -1,4 +1,5 @@
-// One tap/click menu: save, copy URL, full screen and exact coordinate entry.
+// One tap/click menu: save, copy URL, full screen, location overview and exact
+// coordinate entry.
 // The dialog lives outside the viewport element, so navigation never sees its
 // pointer, wheel or keyboard events. It is built lazily on first use.
 
@@ -6,7 +7,7 @@ const COPY = {
   en: {
     menu: 'Mandelbrot menu', save: 'Save image', preparing: 'Preparing PNG…', calculating: 'Calculating…',
     copy: 'Copy URL', copied: 'Copied', copyFailed: "Couldn't copy", fullscreen: 'Full screen',
-    exitFullscreen: 'Exit full screen', coordinates: 'Enter coordinates', close: 'Close', percent: '%',
+    exitFullscreen: 'Exit full screen', overview: 'Show location', coordinates: 'Enter coordinates', close: 'Close', percent: '%',
     x: 'Centre x', y: 'Centre y', zoom: 'Zoom (power of 2)', paste: 'Paste a URL or image metadata',
     pastePlaceholder: 'https://…#x=…&y=…&zoom=… or {"center_x": …}', found: 'Found:', nothing: 'No coordinates found',
     show: 'Show', back: 'Back', number: 'Enter a number', zoomRange: 'Enter a zoom of 0 or more',
@@ -15,7 +16,7 @@ const COPY = {
   de: {
     menu: 'Mandelbrot-Menü', save: 'Bild speichern', preparing: 'PNG wird vorbereitet…', calculating: 'Wird berechnet…',
     copy: 'URL kopieren', copied: 'Kopiert', copyFailed: 'Kopieren fehlgeschlagen', fullscreen: 'Vollbild',
-    exitFullscreen: 'Vollbild beenden', coordinates: 'Koordinaten eingeben', close: 'Schließen', percent: '\u00a0%',
+    exitFullscreen: 'Vollbild beenden', overview: 'Ausschnitt zeigen', coordinates: 'Koordinaten eingeben', close: 'Schließen', percent: '\u00a0%',
     x: 'Mittelpunkt x', y: 'Mittelpunkt y', zoom: 'Zoom (Zweierpotenz)', paste: 'URL oder Bild-Metadaten einfügen',
     pastePlaceholder: 'https://…#x=…&y=…&zoom=… oder {"center_x": …}', found: 'Erkannt:', nothing: 'Keine Koordinaten gefunden',
     show: 'Anzeigen', back: 'Zurück', number: 'Zahl eingeben', zoomRange: 'Zoom ab 0 eingeben',
@@ -80,6 +81,7 @@ const ICONS = {
   save: 'M12 4v11m0 0l-4-4m4 4l4-4M5 19h14',
   copy: 'M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1',
   fullscreen: 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5',
+  overview: 'M5 4h14a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1zM14.5 9a1 1 0 1 0 0 2a1 1 0 0 0 0-2z',
   coordinates: 'M12 3v4M12 17v4M3 12h4M17 12h4M12 8a4 4 0 1 0 0 8a4 4 0 0 0 0-8z',
   close: 'M6 6l12 12M18 6L6 18'
 };
@@ -164,6 +166,7 @@ export function createMenu(api) {
     item('save', text.save, save);
     item('copy', text.copy, copyURL);
     item('fullscreen', text.fullscreen, () => { api.toggleFullscreen(); close(); });
+    item('overview', text.overview, () => { close(); api.showOverview(); });
     item('coordinates', text.coordinates, showForm);
     const separator = documentRef.createElement('div'); separator.className = 'mm-separator'; actions.append(separator);
     item('close', text.close, close);
